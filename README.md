@@ -504,6 +504,17 @@ except ClientError as e:
 `application/.gitignore`에 `config.json`이 있어 UI용 설정은 저장소에 없을 수 있습니다.
 
 
+
+### UI에서 요청이 흐르는 방식
+
+사용자 입력은 Streamlit `app.py`에서 `agentcore_client.run_harness`로 넘어가고, 내부에서 Data Plane 클라이언트 `bedrock-agentcore`의 `invoke_harness`가 `HARNESS_ARN`(또는 설정·목록으로 해석한 ARN)을 대상으로 스트리밍 응답을 처리한 뒤, 텍스트(및 필요 시 이미지 URL)를 화면에 붙입니다.
+
+```
+사용자 → application/app.py
+              → agentcore_client.run_harness (InvokeHarness, 스트림 파싱)
+                    → AWS AgentCore Harness (격리 런타임)
+```
+
 ## 설치하기
 
 아래 명령어로 실행합니다.
@@ -536,16 +547,6 @@ python deployment/delete_harness.py
 
 
 
-
-### UI에서 요청이 흐르는 방식
-
-사용자 입력은 Streamlit `app.py`에서 `agentcore_client.run_harness`로 넘어가고, 내부에서 Data Plane 클라이언트 `bedrock-agentcore`의 `invoke_harness`가 `HARNESS_ARN`(또는 설정·목록으로 해석한 ARN)을 대상으로 스트리밍 응답을 처리한 뒤, 텍스트(및 필요 시 이미지 URL)를 화면에 붙입니다.
-
-```
-사용자 → application/app.py
-              → agentcore_client.run_harness (InvokeHarness, 스트림 파싱)
-                    → AWS AgentCore Harness (격리 런타임)
-```
 
 ## 관련 문서
 
