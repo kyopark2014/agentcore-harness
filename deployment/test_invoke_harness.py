@@ -26,7 +26,7 @@ response = runtime.invoke_harness(
     actorId="user-alice",          # 사용자별 메모리 격리 (선택)
     messages=[{
         "role": "user",
-        "content": [{"text": "Research three tropical vacation options under $3k."}]
+        "content": [{"text": "AWS Document를 이용하여 AgentCore Harness에 대해 조사하세요."}]
     }]
 )
 
