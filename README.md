@@ -33,7 +33,7 @@ AWS 오픈소스 에이전트 프레임워크인 [Strands Agents](https://strand
 - `shell` — bash 명령 실행
 - `file_operations` — 파일 뷰 / 생성 / 편집
 
-> 참고: AgentCore Harness가 노출하는 내장 도구 구성은 제품 버전·설정에 따라 다를 수 있습니다. `deployment/create_harness.py`는 `tools`에 원격 MCP 2개(Exa, AWS Knowledge)와 Browser·Code Interpreter만 선언하며, `shell` 등을 따로 추가하지는 않습니다.
+> 참고: AgentCore Harness가 노출하는 내장 도구 구성은 제품 버전·설정에 따라 다를 수 있습니다. `deployment/create_harness.py`는 `tools`에 원격 MCP 2개(Exa, AWS Document)와 Browser·Code Interpreter만 선언하며, `shell` 등을 따로 추가하지는 않습니다.
 
 
 
