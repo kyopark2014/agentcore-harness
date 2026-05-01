@@ -51,6 +51,192 @@ AWS 오픈소스 에이전트 프레임워크인 **[[Strands Agents]]** 로 구�
 | `@server` | `"@git"` | MCP 서버의 모든 도구 |
 | `@server/tool` | `"@git/git_status"` | 특정 MCP 도구 |
 
+## 🐍 boto3로 배포하기 (create_harness)
+
+> [!note] 클라이언트 구분
+> - **Control Plane** (`bedrock-agentcore-control`): 하네스 생성/수정/삭제 등 관리 작업
+> - **Data Plane** (`bedrock-agentcore`): 하네스 호출 (InvokeHarness)
+
+```python
+import boto3
+
+control = boto3.client("bedrock-agentcore-control", region_name="us-west-2")
+```
+
+### 필수 파라미터
+
+| 파라미터 | 타입 | 설명 |
+|---|---|---|
+| `harnessName` | string | 하네스 이름. 영문자로 시작, 영숫자와 언더스코어만 허용 |
+| `executionRoleArn` | string | 하네스가 실행 시 assume할 IAM 역할 ARN |
+
+### 최소 생성 예시
+
+```python
+response = control.create_harness(
+    harnessName="MyResearchAgent",
+    executionRoleArn="arn:aws:iam::123456789012:role/MyHarnessRole"
+)
+
+harness = response["harness"]
+print(f"Harness ID  : {harness['harnessId']}")
+print(f"Harness ARN : {harness['arn']}")
+print(f"Status      : {harness['status']}")  # CREATING → READY
+```
+
+> [!tip] `clientToken`을 지정하지 않으면 자동 생성된다 (멱등성 보장용)
+
+---
+
+## Boto3로 배포하기
+
+### 📦 전체 파라미터 레퍼런스
+
+#### 모델 설정 (`model`)
+
+세 가지 모델 제공자 중 **하나만** 지정 (Tagged Union).
+
+```python
+# Amazon Bedrock
+model={
+    "bedrockModelConfig": {
+        "modelId": "anthropic.claude-sonnet-4-5",  # [REQUIRED]
+        "maxTokens": 4096,      # 모델 호출당 최대 생성 토큰
+        "temperature": 0.7,
+        "topP": 0.9
+    }
+}
+
+# OpenAI
+model={
+    "openAiModelConfig": {
+        "modelId": "gpt-4o",               # [REQUIRED]
+        "apiKeyArn": "arn:aws:...",         # [REQUIRED] AgentCore Identity의 API Key ARN
+        "maxTokens": 4096,
+        "temperature": 0.7,
+        "topP": 0.9
+    }
+}
+
+# Google Gemini
+model={
+    "geminiModelConfig": {
+        "modelId": "gemini-1.5-pro",       # [REQUIRED]
+        "apiKeyArn": "arn:aws:...",         # [REQUIRED] AgentCore Identity의 API Key ARN
+        "maxTokens": 4096,
+        "temperature": 0.7,
+        "topP": 0.9,
+        "topK": 40                          # Gemini 전용
+    }
+}
+```
+
+#### 시스템 프롬프트 (`systemPrompt`)
+
+```python
+systemPrompt=[
+    {"text": "You are a helpful research assistant specializing in travel."}
+]
+```
+
+#### 도구 설정 (`tools`)
+
+5가지 도구 타입 지원:
+
+```python
+tools=[
+    # 1. 원격 MCP 서버
+    {
+        "type": "remote_mcp",
+        "name": "exa-search",
+        "config": {
+            "remoteMcp": {
+                "url": "https://mcp.exa.ai/mcp",
+                "headers": {"Authorization": "Bearer <token>"}  # 선택
+            }
+        }
+    },
+
+    # 2. AgentCore Gateway (SigV4 기본)
+    {
+        "type": "agentcore_gateway",
+        "name": "my-gateway",
+        "config": {
+            "agentCoreGateway": {
+                "gatewayArn": "arn:aws:bedrock-agentcore:us-west-2:123456789012:gateway/my-gw",
+                "outboundAuth": {
+                    "awsIam": {}          # SigV4 (기본값)
+                    # "none": {}          # 인증 없음
+                    # "oauth": { ... }    # OAuth
+                }
+            }
+        }
+    },
+
+    # Gateway + OAuth 인증
+    {
+        "type": "agentcore_gateway",
+        "name": "oauth-gateway",
+        "config": {
+            "agentCoreGateway": {
+                "gatewayArn": "arn:aws:...",
+                "outboundAuth": {
+                    "oauth": {
+                        "providerArn": "arn:aws:...",           # [REQUIRED]
+                        "scopes": ["read", "write"],            # [REQUIRED]
+                        "grantType": "CLIENT_CREDENTIALS",      # CLIENT_CREDENTIALS | AUTHORIZATION_CODE | TOKEN_EXCHANGE
+                        "customParameters": {"key": "value"},
+                        "defaultReturnUrl": "https://myapp.com/callback"
+                    }
+                }
+            }
+        }
+    },
+
+    # 3. AgentCore Browser
+    {
+        "type": "agentcore_browser",
+        "name": "browser",
+        "config": {
+            "agentCoreBrowser": {
+                "browserArn": "arn:aws:..."  # 생략 시 기본 Browser 사용
+            }
+        }
+    },
+
+    # 4. AgentCore Code Interpreter
+    {
+        "type": "agentcore_code_interpreter",
+        "name": "code-interpreter",
+        "config": {
+            "agentCoreCodeInterpreter": {
+                "codeInterpreterArn": "arn:aws:..."  # 생략 시 기본 Code Interpreter 사용
+            }
+        }
+    },
+
+    # 5. Inline Function (클라이언트 사이드 실행 / Human-in-the-loop)
+    {
+        "type": "inline_function",
+        "name": "approve_purchase",
+        "config": {
+            "inlineFunction": {
+                "description": "Request human approval for a purchase",  # [REQUIRED]
+                "inputSchema": {                                          # [REQUIRED]
+                    "type": "object",
+                    "properties": {
+                        "item":   {"type": "string"},
+                        "amount": {"type": "number"}
+                    },
+                    "required": ["item", "amount"]
+                }
+            }
+        }
+    }
+]
+```
+
+
 #### 도구 추가 예시 (CLI)
 
 ```bash
