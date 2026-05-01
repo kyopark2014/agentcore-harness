@@ -309,13 +309,5 @@ for event in response["stream"]:
 
 ## 관련 문서
 
-- [[AgentCore Runtime]]
-- [[AgentCore Gateway]]
-- [[AgentCore Memory]]
-- [[AgentCore Identity]]
-- [[AgentCore Observability]]
-- [[Strands Agents]]
-
-
 [Boto3 - Create Harness](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore-control/client/create_harness.html)
 
