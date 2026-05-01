@@ -477,3 +477,4 @@ except ClientError as e:
 
 [Boto3 - Create Harness](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore-control/client/create_harness.html)
 
+[Boto3 - invoke_agent_runtime_command](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore/client/invoke_agent_runtime_command.html)
