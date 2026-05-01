@@ -38,8 +38,8 @@ def harness_name_for_api(project_name: str) -> str | None:
     normalized = project_name.replace("-", "_")
     if not _HARNESS_NAME_API_RE.fullmatch(normalized):
         logger.error(
-            "harnessName must match [a-zA-Z][a-zA-Z0-9_]{0,39} after '-'→'_': "
-            f"got {normalized!r} from projectName={project_name!r}"
+            f"harness_name_for_api: invalid name after '-→_': {normalized!r}, "
+            f"projectName: {project_name!r}"
         )
         return None
     return normalized
@@ -50,9 +50,8 @@ def _normalize_harness_api_name(value: str) -> str | None:
     n = (value or "").strip().replace("-", "_")
     if not _HARNESS_NAME_API_RE.fullmatch(n):
         logger.error(
-            "Invalid harness API name after '-'→'_': %r (must match "
-            "[a-zA-Z][a-zA-Z0-9_]{0,39})",
-            n,
+            f"_normalize_harness_api_name: invalid: {n!r} "
+            f"(must match [a-zA-Z][a-zA-Z0-9_]{{0,39}})"
         )
         return None
     return n
@@ -111,9 +110,7 @@ def resolve_harness_arn_from_config(cfg: dict, region: str) -> str | None:
         arn = _arn_from_harness_summary(control, h)
         if arn:
             logger.info(
-                "Resolved HARNESS_ARN (harnessName=%r): %s",
-                api_name,
-                arn,
+                f"HARNESS_ARN: resolved: harnessName: {api_name!r}, arn: {arn}"
             )
             return arn
 
@@ -123,21 +120,16 @@ def resolve_harness_arn_from_config(cfg: dict, region: str) -> str | None:
         arn = _arn_from_harness_summary(control, only)
         if arn:
             logger.warning(
-                "No harness named %r; using the only harness in %s (%r). "
-                "Set harnessName or HARNESS_ARN when you have multiple harnesses.",
-                api_name,
-                region,
-                only_name,
+                f"harness lookup: no match for harnessName: {api_name!r}, "
+                f"region: {region}, using only harness: {only_name!r}, "
+                f"set harnessName or HARNESS_ARN if you add more harnesses"
             )
             return arn
 
     logger.error(
-        "No harness named %r in %s. Available harnessName values: %s. "
-        "Use deployment projectName, set application config \"harnessName\", "
-        "or copy \"HARNESS_ARN\" from deployment/config.json.",
-        api_name,
-        region,
-        available,
+        f"harness lookup: no harness named: {api_name!r}, region: {region}, "
+        f"available harnessName: {available}, "
+        f"hint: align projectName, set harnessName, or copy HARNESS_ARN from deployment/config.json"
     )
     return None
 
@@ -831,6 +823,20 @@ def run_agent_in_docker(prompt, agent_type, history_mode, mcp_servers, model_nam
         logger.error(error_msg)
         return f"Error: {error_msg}", []
 
+
+def _json_preview(obj, max_len: int = 2400) -> str:
+    """Compact JSON (or repr) for logs; truncate long payloads."""
+    try:
+        if isinstance(obj, (bytes, bytearray)):
+            return f"<binary {len(obj)} bytes>"
+        s = json.dumps(obj, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):
+        s = str(obj)
+    if len(s) > max_len:
+        return s[:max_len] + f"... (+{len(s) - max_len} chars)"
+    return s
+
+
 def run_harness(prompt, notification_queue=None):
     """
     Run the provisioned AgentCore Harness (deployment/test_invoke_harness.py shape).
@@ -873,7 +879,10 @@ def run_harness(prompt, notification_queue=None):
             region_name=bedrock_region,
             config=boto_config,
         )
-        logger.info(f"invoke_harness session={runtime_session_id!r} actorId={actor_id!r}")
+        logger.debug(
+            f"invoke_harness: harnessArn: {harness_arn}, session: {runtime_session_id}, "
+            f"actorId: {actor_id}, prompt_len: {len(prompt or '')}"
+        )
 
         response = client.invoke_harness(
             harnessArn=harness_arn,
@@ -887,34 +896,240 @@ def run_harness(prompt, notification_queue=None):
             ],
         )
 
+        logger.debug(
+            f"invoke_harness: response_keys: {list(response.keys())}"
+        )
+
         current = ""
+
+        # Per messageStart / content block: map stream events to tool UI slots (like SSE path).
+        block_tool_use: dict[int, tuple[str, str]] = {}
+        block_tool_result: dict[int, str] = {}
+        tool_input_buffers: dict[str, str] = {}
+        tool_result_buffers: dict[str, str] = {}
 
         stream = response.get("stream")
         if stream is None:
-            logger.error("invoke_harness returned no stream")
+            logger.error(
+                f"invoke_harness: no stream, response: {_json_preview(response)}"
+            )
             return "Error: empty Harness response.", []
 
+        event_index = 0
         try:
             for event in stream:
-                if "contentBlockDelta" in event:
-                    delta = event["contentBlockDelta"].get("delta", {})
+                event_index += 1
+                top_keys = list(event.keys())
+                logger.debug(
+                    f"invoke_harness: stream_event: #{event_index}, keys: {top_keys}"
+                )
+                if len(top_keys) != 1:
+                    logger.warning(
+                        f"invoke_harness: stream_event: #{event_index}, "
+                        f"expected_single_key: false, payload: {_json_preview(event, 4000)}"
+                    )
+
+                if "messageStart" in event:
+                    ms = event["messageStart"]
+                    block_tool_use.clear()
+                    block_tool_result.clear()
+                    tool_input_buffers.clear()
+                    tool_result_buffers.clear()
+                    logger.debug(
+                        f"messageStart: role: {ms.get('role')}, full: {_json_preview(ms, 1200)}"
+                    )
+
+                elif "contentBlockStart" in event:
+                    cbs = event["contentBlockStart"]
+                    idx = cbs.get("contentBlockIndex")
+                    start = cbs.get("start") or {}
+                    if notification_queue is not None and start:
+                        if "toolUse" in start:
+                            tu = start["toolUse"] or {}
+                            tid = (tu.get("toolUseId") or "").strip()
+                            name = tu.get("name") or ""
+                            ttype = tu.get("type")
+                            sname = tu.get("serverName")
+                            if tid and idx is not None:
+                                tool_name_list[tid] = name
+                                if hasattr(notification_queue, "register_tool"):
+                                    notification_queue.register_tool(tid, name)
+                                block_tool_use[idx] = (tid, name)
+                                tool_input_buffers[tid] = ""
+                                extra = ""
+                                if ttype:
+                                    extra += f" ({ttype})"
+                                if sname:
+                                    extra += f" server={sname}"
+                                tool_slot_update(
+                                    notification_queue,
+                                    f"{tid}:input",
+                                    f"Tool: {name}{extra}, Input: …",
+                                )
+                                logger.info(
+                                    f"[tool] {name}, toolUseId: {tid}, type: {ttype}, server: {sname}"
+                                )
+                        if "toolResult" in start:
+                            tr = start["toolResult"] or {}
+                            tid = (tr.get("toolUseId") or "").strip()
+                            status = tr.get("status")
+                            if tid and idx is not None:
+                                block_tool_result[idx] = tid
+                                tool_result_buffers[tid] = ""
+                                tlabel = tool_name_list.get(tid, tid)
+                                tool_slot_update(
+                                    notification_queue,
+                                    f"{tid}:result",
+                                    f"Tool Result ({tlabel}): …"
+                                    + (f" [{status}]" if status else ""),
+                                )
+                                logger.info(
+                                    f"[tool_result_start] toolUseId: {tid}, name: {tlabel}, status: {status}"
+                                )
+                    logger.debug(
+                        f"contentBlockStart: contentBlockIndex: {cbs.get('contentBlockIndex')}, "
+                        f"full: {_json_preview(cbs, 3200)}"
+                    )
+
+                elif "contentBlockDelta" in event:
+                    cbd = event["contentBlockDelta"]
+                    idx = cbd.get("contentBlockIndex")
+                    delta = cbd.get("delta") or {}
+                    dkeys = list(delta.keys())
                     if "text" in delta:
-                        piece = delta["text"]
+                        piece = delta["text"] or ""
+                        logger.info("%s", piece)
                         current += piece
                         update_streaming_result(notification_queue, current)
+                    if [k for k in dkeys if k != "text"]:
+                        logger.debug(
+                            f"contentBlockDelta: contentBlockIndex: {idx}, delta_keys: {dkeys}"
+                        )
+                    if "toolUse" in delta:
+                        tu = delta["toolUse"] or {}
+                        tin = tu.get("input")
+                        if isinstance(tin, str) and tin and idx is not None:
+                            pair = block_tool_use.get(idx)
+                            if pair:
+                                tid, name = pair
+                                tool_input_buffers[tid] = (
+                                    tool_input_buffers.get(tid, "") + tin
+                                )
+                                logger.info(
+                                    f"[tool_input] {name}, toolUseId: {tid}, "
+                                    f"input: {_json_preview(tool_input_buffers[tid], 4000)}"
+                                )
+                                if notification_queue is not None:
+                                    tool_slot_update(
+                                        notification_queue,
+                                        f"{tid}:input",
+                                        f"Tool: {name}, Input: {tool_input_buffers[tid]}",
+                                    )
+                            else:
+                                logger.info(
+                                    f"[tool_input_delta] contentBlockIndex: {idx}, "
+                                    f"fragment: {_json_preview(tin, 1600)}"
+                                )
+                    if "toolResult" in delta:
+                        tr_part = delta.get("toolResult")
+                        if tr_part is not None:
+                            tid = (
+                                block_tool_result.get(idx)
+                                if idx is not None
+                                else None
+                            )
+                            if tid:
+                                buf = tool_result_buffers.get(tid, "")
+                                if isinstance(tr_part, list):
+                                    for item in tr_part:
+                                        if isinstance(item, dict):
+                                            if "text" in item:
+                                                buf += item.get("text") or ""
+                                            elif "json" in item:
+                                                buf += _json_preview(
+                                                    item.get("json"), 8000
+                                                )
+                                        else:
+                                            buf += str(item)
+                                else:
+                                    buf += _json_preview(tr_part, 8000)
+                                tool_result_buffers[tid] = buf
+                                tname = tool_name_list.get(tid, "")
+                                logger.info(
+                                    f"[tool_result] {tname}, toolUseId: {tid}, "
+                                    f"body: {_json_preview(buf, 5000)}"
+                                )
+                                if notification_queue is not None:
+                                    tool_slot_update(
+                                        notification_queue,
+                                        f"{tid}:result",
+                                        f"Tool Result ({tname}): {buf}",
+                                    )
+                                content, urls, refs = get_tool_info(tname, buf)
+                                if refs:
+                                    for r in refs:
+                                        references.append(r)
+                                if urls:
+                                    for url in urls:
+                                        image_url.append(url)
+                                if content:
+                                    logger.info(
+                                        f"tool_result: parsed_content_len: {len(content)}"
+                                    )
+                    if "reasoningContent" in delta:
+                        rc = delta["reasoningContent"]
+                        if isinstance(rc, dict):
+                            logger.debug(
+                                f"contentBlockDelta: reasoningContent: keys: {list(rc.keys())}, "
+                                f"full: {_json_preview(rc, 2400)}"
+                            )
+                        else:
+                            logger.debug(
+                                f"contentBlockDelta: reasoningContent: {_json_preview(rc, 1200)}"
+                            )
+
+                elif "contentBlockStop" in event:
+                    cbe = event["contentBlockStop"]
+                    logger.debug(
+                        f"contentBlockStop: contentBlockIndex: {cbe.get('contentBlockIndex')}, "
+                        f"full: {_json_preview(cbe, 800)}"
+                    )
 
                 elif "messageStop" in event:
-                    logger.info(
-                        "messageStop stopReason=%s",
-                        event["messageStop"].get("stopReason"),
+                    ms = event["messageStop"]
+                    logger.debug(
+                        f"messageStop: stopReason: {ms.get('stopReason')}, "
+                        f"full: {_json_preview(ms, 800)}"
                     )
 
                 elif "metadata" in event:
-                    usage = event["metadata"].get("usage", {})
-                    logger.info(
-                        "usage input=%s output=%s",
-                        usage.get("inputTokens"),
-                        usage.get("outputTokens"),
+                    meta = event["metadata"]
+                    usage = meta.get("usage") or {}
+                    metrics = meta.get("metrics") or {}
+                    logger.debug(
+                        f"metadata: usage: inputTokens: {usage.get('inputTokens')}, "
+                        f"outputTokens: {usage.get('outputTokens')}, "
+                        f"totalTokens: {usage.get('totalTokens')}, "
+                        f"cacheReadInputTokens: {usage.get('cacheReadInputTokens')}, "
+                        f"cacheWriteInputTokens: {usage.get('cacheWriteInputTokens')}"
+                    )
+                    if metrics:
+                        logger.debug(
+                            f"metadata: metrics: latencyMs: {metrics.get('latencyMs')}, "
+                            f"full: {_json_preview(metrics, 800)}"
+                        )
+                    logger.debug(f"metadata: full: {_json_preview(meta, 2000)}")
+
+                elif "internalServerException" in event:
+                    exc = event["internalServerException"]
+                    logger.error(
+                        f"internalServerException: {_json_preview(exc, 1600)}"
+                    )
+
+                elif "validationException" in event:
+                    exc = event["validationException"]
+                    logger.error(
+                        f"validationException: {_json_preview(exc, 2400)}"
                     )
 
                 elif "runtimeClientError" in event:
@@ -924,14 +1139,31 @@ def run_harness(prompt, notification_queue=None):
                         if isinstance(err_blob, dict)
                         else str(err_blob)
                     )
-                    logger.error("runtimeClientError: %s", msg)
+                    logger.error(
+                        f"runtimeClientError: message: {msg!r}, "
+                        f"full: {_json_preview(err_blob, 1600)}"
+                    )
                     add_notification(notification_queue, f"Harness error: {msg}")
                     err_line = f"\n\n[Harness error]\n{msg}"
                     current = (current + err_line) if current.strip() else f"Error: {msg}"
 
+                elif "SDK_UNKNOWN_MEMBER" in event:
+                    logger.warning(
+                        f"invoke_harness: SDK_UNKNOWN_MEMBER: "
+                        f"{_json_preview(event['SDK_UNKNOWN_MEMBER'], 800)}"
+                    )
+
+                else:
+                    logger.warning(
+                        f"invoke_harness: stream_event: #{event_index}, unhandled: "
+                        f"{_json_preview(event, 4000)}"
+                    )
+
+            logger.debug(f"invoke_harness: stream_done: events: {event_index}")
+
         except EventStreamError as e:
             error_msg = str(e)
-            logger.error("Harness stream failure: %s", error_msg)
+            logger.error(f"Harness: stream failure: {error_msg}")
             return f"Error: {error_msg}", []
 
         result = current
@@ -948,7 +1180,9 @@ def run_harness(prompt, notification_queue=None):
         if notification_queue is not None:
             notification_queue.result(result)
 
-        logger.info("result length=%d", len(result) if isinstance(result, str) else -1)
+        logger.debug(
+            f"invoke_harness: result_len: {len(result) if isinstance(result, str) else -1}"
+        )
         return result, image_url
 
     except Exception as e:
