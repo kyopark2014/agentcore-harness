@@ -503,26 +503,7 @@ except ClientError as e:
 
 `application/.gitignore`에 `config.json`이 있어 UI용 설정은 저장소에 없을 수 있습니다.
 
-### 설정 파일 두 벌
 
-- `deployment/config.json`: 배포·삭제·CLI 테스트 스크립트가 사용합니다.
-- `application/config.json`: `utils.load_config()`가 `application/` 기준으로만 읽습니다. UI를 쓰려면 `deployment`에서 만든 값과 맞추거나 파일을 복사해 `region`, `projectName`, `accountId`, `HARNESS_ARN`(또는 `ListHarnesses`로 찾을 수 있게 `projectName`/`harnessName`)을 동일하게 두는 것이 안전합니다.
-
-### 사전 준비
-
-- AWS Harness 시작 가이드는 boto3/SDK 사용 시 Python 3.10 이상을 전제로 합니다. 로컬 UI·스크립트도 가능한 한 그에 맞추는 것이 좋습니다.
-- AWS 자격증명(프로파일 또는 환경 변수) 및 AgentCore·Bedrock·IAM 권한
-- Python 패키지 예: `boto3`, `botocore`, 배포 스크립트용 `bedrock_agentcore`(패키지 이름은 AWS 배포 가이드에 따름), UI용 `streamlit`, `requests`, `langchain-aws`
-
-### 권장 실행 순서
-
-1. `deployment/config.json`에 `region`, `projectName`, 필요 시 `accountId`를 둡니다.
-2. `cd deployment` 후 `python3 create_harness.py` — Harness가 `READY`가 될 때까지 기다린 뒤 같은 디렉터리의 `config.json`이 갱신됩니다.
-3. UI 사용 시 `deployment/config.json`을 `application/config.json`으로 복사하거나, 동일 키를 수동으로 맞춥니다.
-4. `cd application` 후 `streamlit run app.py` — 채팅으로 Harness를 호출합니다. 작업 디렉터리는 `application/`인 상태가 로컬 `import chat`, `import utils`와 맞습니다.
-5. (선택) `cd deployment` 후 `python3 test_invoke_harness.py`로 CLI에서 스트림만 확인합니다.
-6. (선택) `deployment`에서 `python3 execute_command_harness.py`로 런타임 셸 명령만 실행합니다.
-7. 정리 시 `cd deployment` 후 `python3 delete_harness.py`입니다.
 
 ### UI에서 요청이 흐르는 방식
 
