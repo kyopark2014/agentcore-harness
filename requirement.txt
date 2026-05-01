@@ -1,0 +1,13 @@
+# AgentCore Harness: deployment scripts + Streamlit application
+# Install: pip install -r requirement.txt
+#
+# bedrock-agentcore-control APIs (e.g. ListHarnesses) need a recent botocore.
+# If calls fail: pip install -U boto3 (pulls a compatible botocore).
+
+boto3>=1.35.0
+bedrock-agentcore>=1.4.0
+
+# application/app.py, chat.py, agentcore_client.py
+streamlit>=1.30.0
+requests>=2.31.0
+langchain-aws>=0.2.0
