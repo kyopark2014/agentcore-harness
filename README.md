@@ -6,19 +6,22 @@ AgentCore의 관리형 에이전트 하네스(Managed Agent Harness) 는 이 모
 
 ### 격리된 microVM 실행
 
-- 모든 세션이 보안 격리된 Firecracker microVM** 에서 실행
+- 모든 세션이 보안 격리된 Firecracker microVM에서 실행
 - 세션별 독립 파일시스템 & 셸 보유
 - 기본적으로 Stateful 세션 간 상태 유지
 
-### 멀티 모델 지원
+### 모델 (Amazon Bedrock)
 
-- Amazon Bedrock, OpenAI, Google Gemini 등 모든 모델 사용 가능
-- 세션 중에도 모델 제공업체 전환 가능 (컨텍스트 유실 없음)
-- 기본 모델: Anthropic Claude Sonnet 4.6
+- 이 저장소의 `deployment/create_harness.py`는 Amazon Bedrock Inference Profile을 사용합니다.
+
+본 저장소 배포 기본값
+
+- 모델 ID: `global.anthropic.claude-opus-4-7`
+- `CreateHarness`의 `maxTokens`: `get_max_output_tokens(model_id)` (이 모델은 128000)
 
 ### Strands Agents 기반
 
-AWS 오픈소스 에이전트 프레임워크인 **[[Strands Agents]]** 로 구동
+AWS 오픈소스 에이전트 프레임워크인 [[Strands Agents]] 로 구동
 
 
 
@@ -42,6 +45,8 @@ AWS 오픈소스 에이전트 프레임워크인 **[[Strands Agents]]** 로 구�
 - `shell` — bash 명령 실행
 - `file_operations` — 파일 뷰 / 생성 / 편집
 
+> 참고: AgentCore Harness가 노출하는 내장 도구 구성은 제품 버전·설정에 따라 다를 수 있습니다. `deployment/create_harness.py`는 `tools`에 원격 MCP 2개(Exa, AWS Knowledge)와 Browser·Code Interpreter만 선언하며, `shell` 등을 따로 추가하지는 않습니다.
+
 `allowedTools` 파라미터로 허용 도구 제어 가능합니다.
 
 | 패턴 | 예시 | 매칭 |
@@ -54,6 +59,63 @@ AWS 오픈소스 에이전트 프레임워크인 **[[Strands Agents]]** 로 구�
 
 
 
+## 이 저장소: `deployment/create_harness.py`가 하는 일
+
+`deployment/config.json`을 읽어 AgentCore Memory와 Harness를 맞춰 둡니다. (`bedrock-agentcore-control`, IAM, `bedrock_agentcore.memory.MemoryClient` 사용.)
+
+### 설정 파일
+
+- 경로: `deployment/config.json`
+- 주요 키: `region`, `projectName` (기본값 예: `agent-harness`), 선택 `accountId` (문자열 권장), 이후 스크립트가 채움: `executionRoleArn`, `agentcore_memory_role`, `agent_memory_arn`, `harnessId`, `HARNESS_ARN`. 셸 전용 호출에는 선택적으로 `agentRuntimeArn` 을 넣을 수 있습니다(`deployment/execute_command_harness.py`가 `agentRuntimeArn` 없으면 `HARNESS_ARN` 으로 폴백).
+
+### Harness 이름 규칙
+
+- API `harnessName` = `projectName`에서 하이픈(`-`)을 언더스코어(`_`)로 치환한 값
+- 패턴: `[a-zA-Z][a-zA-Z0-9_]{0,39}` (하이픈 불가)
+
+### IAM 역할
+
+| 용도 | 역할 이름 패턴 |
+|------|----------------|
+| Harness 실행 | `role-harness-for-{projectName}-{region}` |
+| AgentCore Memory 실행 | `role-agentcore-memory-for-{projectName}-{region}` |
+
+- Harness 실행 역할 trust: `bedrock-agentcore.amazonaws.com`만 (`SourceAccount` 조건 없음 — CreateHarness 검증과 맞춤).
+- Memory 실행 역할 trust: 동일 서비스 + `aws:SourceAccount`, `aws:SourceArn` (`arn:aws:bedrock-agentcore:{region}:{account}:*`) — CreateMemory 검증용.
+
+### AgentCore Memory
+
+- 이름 토큰: `projectName`의 `-` → `_` (예: `agent-harness` → `agent_harness`)
+- `agent_memory_arn`이 없으면: 제어 플레인에서 메모리 목록을 보고 동일 접두 ID가 있으면 재사용, 없으면 custom memory strategy(user preference 추출)로 생성. 추출 모델은 스크립트에 정의된 Bedrock 모델 ID 사용 (`deployment/agentcore_memory`의 프롬프트 참조).
+- CreateMemory가 trust 검증으로 실패할 때: IAM 전파 여유를 두기 위해 짧은 대기·재시도 로직이 있습니다.
+
+### CreateHarness 인자(이 레포가 넘기는 값)
+
+- `model.bedrockModelConfig`: `modelId` = `global.anthropic.claude-opus-4-7`, `maxTokens` = 위 헬퍼 값
+- `systemPrompt`: 한국어/에이전트 워크플로 설명 텍스트 (`BASE_SYSTEM_PROMPT`)
+- `tools` (실제 4개):
+  - `remote_mcp` exa — `https://mcp.exa.ai/mcp`
+  - `remote_mcp` aws_knowledge — `https://knowledge-mcp.global.api.aws` ([AWS Knowledge MCP Server](https://awslabs.github.io/mcp/servers/aws-knowledge-mcp-server))
+  - `agentcore_browser` browser
+  - `agentcore_code_interpreter` code
+- `memory.agentCoreMemoryConfiguration.arn`: 위에서 확보한 Memory ARN
+- `truncation`: sliding window, `messagesCount` 50
+- `maxIterations` 20, `maxTokens` 50000, `timeoutSeconds` 300
+- `environment.agentCoreRuntimeEnvironment`: 퍼블릭 네트워크, 세션 타임아웃 등
+- `environmentVariables`: `LOG_LEVEL` = `info` 만 설정 (stdio MCP용 `MCP_SERVERS_JSON` 등은 사용하지 않음)
+- `skills` 배열은 이 스크립트에서 설정하지 않습니다.
+
+### 이미 Harness가 있을 때
+
+- 같은 `harnessName`이 있으면 CreateHarness를 호출하지 않고 기존 `harnessId`를 사용합니다. tools/모델 변경만 코드로 반영하려면 콘솔에서 Harness를 수정하거나 `UpdateHarness` API로 전체 `tools` 등을 다시 넘겨야 합니다.
+- Memory ARN이 바뀌었으면 `ensure_harness_memory_binding`으로 `update_harness`에 가까운 방식으로 메모리만 맞춥니다.
+
+### 완료 후
+
+- `get_harness`로 최대 약 2분(24×5초)까지 `READY` 폴링
+- `deployment/config.json`에 `harnessId`, `HARNESS_ARN` 저장
+
+---
 
 ## boto3로 배포하기
 
@@ -173,7 +235,7 @@ tags={
 }
 ```
 
-**Skills를 환경에 넣는 방법:**
+Skills를 환경에 넣는 방법:
 1. 컨테이너 이미지에 베이크 (권장, 프로덕션용) — 이미지 내 고정 경로에 포함
 2. 세션 시작 시 설치 — `InvokeAgentRuntimeCommand`로 설치
 
@@ -190,18 +252,18 @@ tags={
 | VPC 연결 | 프라이빗 리소스 접근 |
 | Cedar 기반 정책 | Gateway 도구 호출 세밀한 접근 제어 |
 
-**IAM 권한 모델:**
+IAM 권한 모델:
 - `InvokeHarness` → `bedrock-agentcore:InvokeHarness` + `bedrock-agentcore:InvokeAgentRuntime` 필요
 - `UpdateHarness` → `bedrock-agentcore:UpdateAgentRuntime` 필요
 - `DeleteHarness` → `bedrock-agentcore:DeleteAgentRuntime` 필요
 
 > [!warning] SigV4(AWS IAM) 인증 시 per-user Identity 전파 미지원
-> 사용자별 자격증명 범위가 필요하면 **Inbound OAuth** 설정 필요. SigV4 per-user identity 지원은 향후 릴리스 예정.
+> 사용자별 자격증명 범위가 필요하면 Inbound OAuth 설정 필요. SigV4 per-user identity 지원은 향후 릴리스 예정.
 
 
-### 도구 설정 (`tools`)
+### 도구 설정 (`tools`) — API 일반 예시
 
-5가지 도구 타입 지원:
+아래는 Boto3 `CreateHarness`가 허용하는 도구 타입 예시입니다. 이 저장소의 `create_harness.py`는 위 섹션에 적은 4개 도구만 연결합니다 (Gateway·inline_function 등은 포함하지 않음).
 
 ```python
 tools=[
@@ -310,7 +372,7 @@ tools=[
 - `summarization` — 요약
 - `user preference` — 사용자 선호도
 - `episodic` — 에피소딕 기억
-- `custom` — 커스텀
+- `custom` — 커스텀 (`deployment/create_harness.py`는 Memory 생성 시 custom 전략으로 사용자 선호 추출을 사용합니다.)
 
 Actor ID 로 사용자별 격리 메모리를 제공합니다.
 - `actorId + sessionId` 스코프로 사용자별 독립 메모리
@@ -319,11 +381,9 @@ Actor ID 로 사용자별 격리 메모리를 제공합니다.
 
 ### 환경 & Skills (Environment & Skills)
 
-#### 직접 셸 접근 (InvokeAgentRuntimeCommand)
+모델 없이 런타임에 셸만 쓰는 `InvokeAgentRuntimeCommand` 는 아래 Python SDK 절의 코드 예시를 참고하세요.
 
-모델 추론 없이, 토큰 비용 없이 microVM에 직접 셸 접근 가능.
-
-**사용 시나리오:**
+사용 시나리오:
 - 에이전트 시작 전 환경 준비 (repo clone, 의존성 설치, 파일 복사)
 - 에이전트 실행 후 후처리 (테스트, commit/push, 아티팩트 추출)
 - 개발 중 VM 검사 (`ls`, `cat`, `env`, `python --version`)
@@ -335,25 +395,39 @@ Actor ID 로 사용자별 격리 메모리를 제공합니다.
 - 반드시 `linux/arm64` 플랫폼으로 빌드 필요
 - 하네스가 컨테이너의 `ENTRYPOINT`와 `CMD`를 오버라이드
 
-
-
+Skills: AgentCore Skills는 API로 연결할 수 있으나, `create_harness.py`는 `skills` 배열을 설정하지 않습니다 (위 “이 저장소” 절 참고).
 ### Python SDK (boto3) 방식
 
 
-#### invoke_harness 
+#### invoke_harness
+
+`deployment/create_harness.py` 실행 후 `deployment/config.json`에 저장되는 `HARNESS_ARN`으로 에이전트를 호출합니다. 호출·스트림 처리 예시는 `deployment/test_invoke_harness.py` 와 동일합니다.
 
 ```python
 import boto3
+import json
+import os
 
-client = boto3.client("bedrock-agentcore", region_name="us-west-2")
+working_dir = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(working_dir, "config.json"), encoding="utf-8") as f:
+    _cfg = json.load(f)
 
-response = client.invoke_harness(
-    harnessArn="arn:aws:bedrock-agentcore:us-west-2:123456789012:harness/MyHarness-XyZ123",
-    runtimeSessionId="1234abcd-12ab-34cd-56ef-1234567890ab",  # 최소 33자 이상
-    messages=[{
-        "role": "user",
-        "content": [{"text": "Research three tropical vacation options under $3k."}]
-    }],
+bedrock_region = _cfg.get("region", "us-west-2")
+HARNESS_ARN = _cfg["HARNESS_ARN"]  # create_harness.py 가 기록
+
+runtime = boto3.client("bedrock-agentcore", region_name=bedrock_region)
+SESSION_ID = "1234abcd-12ab-34cd-56ef-1234567890ab"  # 최소 33자권장, 동일 ID로 대화 연속
+
+response = runtime.invoke_harness(
+    harnessArn=HARNESS_ARN,
+    runtimeSessionId=SESSION_ID,
+    actorId="user-alice",  # 선택: 메모리 격리용 (Harness Memory 설정과 맞출 것)
+    messages=[
+        {
+            "role": "user",
+            "content": [{"text": "질문 내용"}],
+        }
+    ],
 )
 
 for event in response["stream"]:
@@ -361,26 +435,40 @@ for event in response["stream"]:
         delta = event["contentBlockDelta"].get("delta", {})
         if "text" in delta:
             print(delta["text"], end="", flush=True)
+    elif "messageStop" in event:
+        print(f"\n\n[Stop reason: {event['messageStop']['stopReason']}]")
+    elif "metadata" in event:
+        usage = event["metadata"].get("usage", {})
+        print(
+            f"[Tokens - input: {usage.get('inputTokens')}, output: {usage.get('outputTokens')}]"
+        )
     elif "runtimeClientError" in event:
-        print(f"\nError: {event['runtimeClientError']['message']}")
+        print(f"\n[Error]: {event['runtimeClientError']['message']}")
 ```
 
 
 #### 직접 셸 접근 (InvokeAgentRuntimeCommand)
 
-모델 추론 없이, 토큰 비용 없이 microVM에 직접 셸 접근 가능.
+모델 추론 없이 런타임 컨테이너에서 셸 명령만 실행합니다. 인자는 `agentRuntimeArn` (Agent Runtime ARN)이며, `HARNESS_ARN` 과 같지 않을 수 있습니다. 이 레포에서는 `deployment/execute_command_harness.py`가 `config.json`의 `agentRuntimeArn`(또는 임시로 `HARNESS_ARN` 폴백)을 사용합니다.
 
 ```python
+import boto3
+
 runtime = boto3.client("bedrock-agentcore", region_name="us-west-2")
 
 response = runtime.invoke_agent_runtime_command(
-    agentRuntimeArn=HARNESS_ARN,
-    runtimeSessionId=SESSION_ID,
-    body={"command": "pip install pandas && ls -la /workspace"},
+    contentType="application/json",
+    accept="application/json",
+    runtimeSessionId="1234abcd-12ab-34cd-56ef-1234567890ab",
+    agentRuntimeArn="arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/...",  # Harness ARN 아님
+    body={
+        "command": "python3 -m pip install pandas && ls -la /workspace",
+        "timeout": 300,
+    },
 )
 
 for event in response["stream"]:
-    chunk = event.get("chunk", {})
+    chunk = event.get("chunk") or {}
     if "contentDelta" in chunk:
         delta = chunk["contentDelta"]
         if "stdout" in delta:
@@ -388,12 +476,14 @@ for event in response["stream"]:
         if "stderr" in delta:
             print(delta["stderr"], end="", flush=True)
     elif "contentStop" in chunk:
-        print(f"\n[exit code: {chunk['contentStop']['exitCode']}]")
+        stop = chunk["contentStop"]
+        print(f"\n[exit code: {stop.get('exitCode')}, status: {stop.get('status')}]")
 ```
 
+스트림에 `validationException`, `runtimeClientError` 등이 올 수 있습니다. 전체 분기 예시는 `deployment/execute_command_harness.py` 를 참고하세요.
 
 
-### 📤 응답 구조
+### 응답 구조
 
 ```python
 response = control.create_harness(...)
@@ -411,7 +501,7 @@ harness = response["harness"]
 | `updatedAt` | datetime | 최종 수정 시각 |
 | `failureReason` | string | 실패 시 사유 |
 
-**status 전체 값:**
+status 전체 값:
 `CREATING` · `CREATE_FAILED` · `UPDATING` · `UPDATE_FAILED` · `READY` · `DELETING` · `DELETE_FAILED`
 
 #### READY 상태까지 폴링하기
@@ -435,7 +525,7 @@ harness = wait_for_harness_ready(control, response["harness"]["harnessId"])
 print(f"Harness ARN: {harness['arn']}")
 ```
 
-### 🔁 예외 처리
+### 예외 처리
 
 ```python
 from botocore.exceptions import ClientError
@@ -471,10 +561,62 @@ except ClientError as e:
 | `InternalServerException` | AWS 내부 오류 |
 
 
+## 저장소 구조와 실행 방법
 
+이 저장소는 AWS 쪽 프로비저닝(`deployment/`)과 로컬 채팅 UI(`application/`)로 나뉩니다.
+
+### 디렉터리 구조
+
+| 경로 | 역할 |
+|---|---|
+| `deployment/config.json` | `region`, `projectName`, `accountId`(권장: 문자열) 등. `create_harness.py` 실행 후 `harnessId`, `HARNESS_ARN`, Memory·IAM ARN 등이 채워짐 |
+| `deployment/create_harness.py` | AgentCore Memory·IAM 역할·Harness 생성 또는 기존 Harness 재사용, READY 폴링 후 `config.json` 갱신 |
+| `deployment/delete_harness.py` | Harness·Memory 삭제, 삭제 완료 폴링, IAM·`config.json` 정리 |
+| `deployment/agentcore_memory.py` | Memory 생성 시 사용하는 프롬프트·설정 |
+| `deployment/test_invoke_harness.py` | `config.json`의 `HARNESS_ARN`으로 `invoke_harness` 스트리밍 호출 예시 |
+| `deployment/execute_command_harness.py` | `invoke_agent_runtime_command`(셸만) 예시. `agentRuntimeArn` 우선, 없으면 `HARNESS_ARN` 폴백 |
+| `application/app.py` | Streamlit UI 진입점 |
+| `application/agentcore_client.py` | Harness ARN 해석(`HARNESS_ARN` 또는 제어 플레인 조회), `invoke_harness` 스트림 처리·`run_harness` |
+| `application/utils.py` | `application/config.json` 로드(없으면 일부 기본값으로 새로 작성 시도) |
+| `application/notification_queue.py` | Streamlit 상태 영역에 도구 진행 등 표시 |
+| `application/chat.py`, `application/info.py` | 앱이 모듈로 로드함. Bedrock 모델 메타데이터·직접 호출 경로용 |
+
+`application/.gitignore`에 `config.json`이 있어 UI용 설정은 저장소에 없을 수 있습니다.
+
+### 설정 파일 두 벌
+
+- `deployment/config.json`: 배포·삭제·CLI 테스트 스크립트가 사용합니다.
+- `application/config.json`: `utils.load_config()`가 `application/` 기준으로만 읽습니다. UI를 쓰려면 `deployment`에서 만든 값과 맞추거나 파일을 복사해 `region`, `projectName`, `accountId`, `HARNESS_ARN`(또는 `ListHarnesses`로 찾을 수 있게 `projectName`/`harnessName`)을 동일하게 두는 것이 안전합니다.
+
+### 사전 준비
+
+- Python 3 환경, AWS 자격증명(프로파일 또는 환경 변수) 및 AgentCore·Bedrock·IAM 권한
+- Python 패키지 예: `boto3`, `botocore`, 배포 스크립트용 `bedrock_agentcore`(패키지 이름은 AWS 배포 가이드에 따름), UI용 `streamlit`, `requests`, `langchain-aws`
+
+### 권장 실행 순서
+
+1. `deployment/config.json`에 `region`, `projectName`, 필요 시 `accountId`를 둡니다.
+2. `cd deployment` 후 `python3 create_harness.py` — Harness가 `READY`가 될 때까지 기다린 뒤 같은 디렉터리의 `config.json`이 갱신됩니다.
+3. UI 사용 시 `deployment/config.json`을 `application/config.json`으로 복사하거나, 동일 키를 수동으로 맞춥니다.
+4. `cd application` 후 `streamlit run app.py` — 채팅으로 Harness를 호출합니다. 작업 디렉터리는 `application/`인 상태가 로컬 `import chat`, `import utils`와 맞습니다.
+5. (선택) `cd deployment` 후 `python3 test_invoke_harness.py`로 CLI에서 스트림만 확인합니다.
+6. (선택) `deployment`에서 `python3 execute_command_harness.py`로 런타임 셸 명령만 실행합니다.
+7. 정리 시 `cd deployment` 후 `python3 delete_harness.py`입니다.
+
+### UI에서 요청이 흐르는 방식
+
+사용자 입력은 Streamlit `app.py`에서 `agentcore_client.run_harness`로 넘어가고, 내부에서 Data Plane 클라이언트 `bedrock-agentcore`의 `invoke_harness`가 `HARNESS_ARN`(또는 설정·목록으로 해석한 ARN)을 대상으로 스트리밍 응답을 처리한 뒤, 텍스트(및 필요 시 이미지 URL)를 화면에 붙입니다.
+
+```
+사용자 → application/app.py
+              → agentcore_client.run_harness (InvokeHarness, 스트림 파싱)
+                    → AWS AgentCore Harness (격리 런타임)
+```
 
 ## 관련 문서
 
 [Boto3 - Create Harness](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore-control/client/create_harness.html)
+
+[Boto3 - Invoke Harness](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore/client/invoke_harness.html)
 
 [Boto3 - invoke_agent_runtime_command](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore/client/invoke_agent_runtime_command.html)
