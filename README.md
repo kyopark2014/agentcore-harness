@@ -20,7 +20,8 @@ AgentCore의 관리형 에이전트 하네스(Managed Agent Harness) 는 이 모
 
 AWS 오픈소스 에이전트 프레임워크인 **[[Strands Agents]]** 로 구동
 
----
+
+
 
 ## 주요 기능
 
@@ -51,17 +52,59 @@ AWS 오픈소스 에이전트 프레임워크인 **[[Strands Agents]]** 로 구�
 | `@server` | `"@git"` | MCP 서버의 모든 도구 |
 | `@server/tool` | `"@git/git_status"` | 특정 MCP 도구 |
 
-## 🐍 boto3로 배포하기 (create_harness)
+
+
+
+## boto3로 배포하기
+
+### create_harness
 
 > [!note] 클라이언트 구분
-> - **Control Plane** (`bedrock-agentcore-control`): 하네스 생성/수정/삭제 등 관리 작업
-> - **Data Plane** (`bedrock-agentcore`): 하네스 호출 (InvokeHarness)
+> - Control Plane (`bedrock-agentcore-control`): 하네스 생성/수정/삭제 등 관리 작업
+> - Data Plane (`bedrock-agentcore`): 하네스 호출 (InvokeHarness)
 
 ```python
 import boto3
 
 control = boto3.client("bedrock-agentcore-control", region_name="us-west-2")
 ```
+
+### API 목록
+
+| API | 설명 |
+|---|---|
+| `CreateHarness` | 하네스 생성 |
+| `GetHarness` | 하네스 정보 조회 |
+| `UpdateHarness` | 하네스 업데이트 |
+| `DeleteHarness` | 하네스 삭제 |
+| `ListHarnesses` | 하네스 목록 조회 |
+| `InvokeHarness` | 에이전트 호출 (스트리밍 응답) |
+| `InvokeAgentRuntimeCommand` | 직접 셸 명령 실행 |
+
+### InvokeHarness 스트리밍 이벤트 타입
+
+| 이벤트 | 설명 |
+|---|---|
+| `messageStart` | 새 메시지 시작 (role 포함) |
+| `contentBlockStart` | 콘텐츠 블록 시작 (text, toolUse, toolResult) |
+| `contentBlockDelta` | 증분 콘텐츠 |
+| `contentBlockStop` | 콘텐츠 블록 종료 |
+| `messageStop` | 메시지 종료 (stopReason 포함) |
+| `metadata` | 토큰 사용량 및 지연 시간 메트릭 |
+| `runtimeClientError` | 실행 중 오류 |
+
+### stopReason 값
+
+| 값 | 의미 |
+|---|---|
+| `end_turn` | 에이전트 정상 종료 |
+| `tool_use` | 인라인 함수 호출 대기 |
+| `max_tokens` | 턴당 토큰 한도 도달 |
+| `max_iterations_exceeded` | maxIterations 한도 초과 |
+| `timeout_exceeded` | timeoutSeconds 한도 초과 |
+| `max_output_tokens_exceeded` | maxTokens 예산 소진 |
+
+
 
 ### 필수 파라미터
 
@@ -86,15 +129,11 @@ print(f"Status      : {harness['status']}")  # CREATING → READY
 
 > [!tip] `clientToken`을 지정하지 않으면 자동 생성된다 (멱등성 보장용)
 
----
 
-## Boto3로 배포하기
 
-### 📦 전체 파라미터 레퍼런스
+### 주요 설정
 
-#### 모델 설정 (`model`)
-
-세 가지 모델 제공자 중 **하나만** 지정 (Tagged Union).
+아래와 같이 모델을 설정합니다.
 
 ```python
 # Amazon Bedrock
@@ -106,32 +145,9 @@ model={
         "topP": 0.9
     }
 }
-
-# OpenAI
-model={
-    "openAiModelConfig": {
-        "modelId": "gpt-4o",               # [REQUIRED]
-        "apiKeyArn": "arn:aws:...",         # [REQUIRED] AgentCore Identity의 API Key ARN
-        "maxTokens": 4096,
-        "temperature": 0.7,
-        "topP": 0.9
-    }
-}
-
-# Google Gemini
-model={
-    "geminiModelConfig": {
-        "modelId": "gemini-1.5-pro",       # [REQUIRED]
-        "apiKeyArn": "arn:aws:...",         # [REQUIRED] AgentCore Identity의 API Key ARN
-        "maxTokens": 4096,
-        "temperature": 0.7,
-        "topP": 0.9,
-        "topK": 40                          # Gemini 전용
-    }
-}
 ```
 
-#### 시스템 프롬프트 (`systemPrompt`)
+시스템 프롬프트를 설정합니다.
 
 ```python
 systemPrompt=[
@@ -139,7 +155,51 @@ systemPrompt=[
 ]
 ```
 
-#### 도구 설정 (`tools`)
+Skills을 설정합니다.
+
+```python
+skills=[
+    {"path": ".agents/skills/xlsx"},
+    {"path": ".agents/skills/github"}
+]
+```
+
+필요시 태그 (`tags`)를 설정합니다.
+
+```python
+tags={
+    "Project": "MyAIProject",
+    "Env": "prod"
+}
+```
+
+**Skills를 환경에 넣는 방법:**
+1. 컨테이너 이미지에 베이크 (권장, 프로덕션용) — 이미지 내 고정 경로에 포함
+2. 세션 시작 시 설치 — `InvokeAgentRuntimeCommand`로 설치
+
+
+
+
+### 보안 & 접근 제어 (Security)
+
+| 보안 기능 | 설명 |
+|---|---|
+| 격리된 실행 | Firecracker microVM, 공유 상태/파일시스템 없음 |
+| IAM 실행 역할 | 최소 권한 원칙 적용 |
+| Inbound OAuth | JWT 기반 호출자 인증 |
+| VPC 연결 | 프라이빗 리소스 접근 |
+| Cedar 기반 정책 | Gateway 도구 호출 세밀한 접근 제어 |
+
+**IAM 권한 모델:**
+- `InvokeHarness` → `bedrock-agentcore:InvokeHarness` + `bedrock-agentcore:InvokeAgentRuntime` 필요
+- `UpdateHarness` → `bedrock-agentcore:UpdateAgentRuntime` 필요
+- `DeleteHarness` → `bedrock-agentcore:DeleteAgentRuntime` 필요
+
+> [!warning] SigV4(AWS IAM) 인증 시 per-user Identity 전파 미지원
+> 사용자별 자격증명 범위가 필요하면 **Inbound OAuth** 설정 필요. SigV4 per-user identity 지원은 향후 릴리스 예정.
+
+
+### 도구 설정 (`tools`)
 
 5가지 도구 타입 지원:
 
@@ -237,26 +297,6 @@ tools=[
 ```
 
 
-#### 도구 추가 예시 (CLI)
-
-```bash
-# 원격 MCP 서버 추가
-agentcore add tool --harness my-agent --type remote_mcp \
-  --name exa --url https://mcp.exa.ai/mcp
-
-# Browser 추가
-agentcore add tool --harness my-agent --type agentcore_browser --name browser
-
-# Code Interpreter 추가
-agentcore add tool --harness my-agent --type agentcore_code_interpreter --name code-interpreter
-
-# Gateway 추가 (ARN으로)
-agentcore add tool --harness my-agent --type agentcore_gateway \
-  --name my-gateway --gateway-arn arn:aws:bedrock-agentcore:us-west-2:123456789012:gateway/my-gateway
-```
-
----
-
 ### 메모리 & 파일시스템 (Memory & Filesystem)
 
 아래 단기/장기로 상태를 유지합니다.
@@ -276,22 +316,6 @@ Actor ID 로 사용자별 격리 메모리를 제공합니다.
 - `actorId + sessionId` 스코프로 사용자별 독립 메모리
 - 파일시스템: S3 마운트로 세션 간 영속적 파일 저장 지원
 
-#### 메모리 설정 예시 (CLI)
-
-```bash
-# 메모리 포함 생성 (기본값)
-agentcore create --name myagent
-
-# 메모리 없이 생성
-agentcore create --name myagent --no-harness-memory
-
-# Actor ID 지정 호출 (사용자별 메모리 격리)
-agentcore invoke --harness research-agent \
-  --session-id "$(uuidgen)" \
-  --actor-id alice \
-  "Research tropical vacations under $3k"
-```
-
 
 ### 환경 & Skills (Environment & Skills)
 
@@ -304,17 +328,6 @@ agentcore invoke --harness research-agent \
 - 에이전트 실행 후 후처리 (테스트, commit/push, 아티팩트 추출)
 - 개발 중 VM 검사 (`ls`, `cat`, `env`, `python --version`)
 
-```bash
-# 의존성 설치
-agentcore invoke --exec --harness my-agent --session-id "$(uuidgen)" \
-  "pip install pandas matplotlib"
-
-# 에이전트가 생성한 파일 확인
-agentcore invoke --exec --harness my-agent --session-id "$(uuidgen)" \
-  "ls -la /tmp && cat /tmp/results.csv"
-```
-
-> [!note] 기본 환경에는 Python과 bash 포함. `git`, `node` 등은 직접 설치하거나 커스텀 환경 사용
 
 #### 커스텀 환경 (컨테이너 이미지)
 
@@ -322,114 +335,12 @@ agentcore invoke --exec --harness my-agent --session-id "$(uuidgen)" \
 - 반드시 `linux/arm64` 플랫폼으로 빌드 필요
 - 하네스가 컨테이너의 `ENTRYPOINT`와 `CMD`를 오버라이드
 
-```bash
-# Dockerfile로 생성
-agentcore create --name coding-agent --container ./Dockerfile
-agentcore deploy
 
-# 사전 빌드 이미지 참조
-agentcore create --name node-agent \
-  --container public.ecr.aws/docker/library/node:slim
-agentcore deploy
-```
-
-#### Agent Skills
-
-마크다운 + 스크립트 번들로 에이전트에게 온디맨드 도메인 지식을 제공합니다.
-
-예시: Excel 파일 처리 방법, 특정 API 사용법
-
-**Skills를 환경에 넣는 방법:**
-1. 컨테이너 이미지에 베이크 (권장, 프로덕션용) — 이미지 내 고정 경로에 포함
-2. 세션 시작 시 설치 — `InvokeAgentRuntimeCommand`로 설치
-
-```bash
-# 세션 시작 시 skill 설치
-agentcore invoke --exec --harness my-agent --session-id "$(uuidgen)" \
-  "npx @anthropic-ai/agent-skills add xlsx github"
-
-# 하네스에 영구 skill 설정
-agentcore add harness --name my-agent \
-  --skill-path .agents/skills/xlsx \
-  --skill-path .agents/skills/github
-agentcore deploy
-
-# 특정 호출에만 skill 오버라이드
-agentcore invoke --harness my-agent --skill-path .agents/skills/xlsx \
-  "Find errors in the Excel files"
-```
-
-
-### 보안 & 접근 제어 (Security)
-
-| 보안 기능 | 설명 |
-|---|---|
-| 격리된 실행 | Firecracker microVM, 공유 상태/파일시스템 없음 |
-| IAM 실행 역할 | 최소 권한 원칙 적용 |
-| Inbound OAuth | JWT 기반 호출자 인증 |
-| VPC 연결 | 프라이빗 리소스 접근 |
-| Cedar 기반 정책 | Gateway 도구 호출 세밀한 접근 제어 |
-
-**IAM 권한 모델:**
-- `InvokeHarness` → `bedrock-agentcore:InvokeHarness` + `bedrock-agentcore:InvokeAgentRuntime` 필요
-- `UpdateHarness` → `bedrock-agentcore:UpdateAgentRuntime` 필요
-- `DeleteHarness` → `bedrock-agentcore:DeleteAgentRuntime` 필요
-
-> [!warning] SigV4(AWS IAM) 인증 시 per-user Identity 전파 미지원
-> 사용자별 자격증명 범위가 필요하면 **Inbound OAuth** 설정 필요. SigV4 per-user identity 지원은 향후 릴리스 예정.
-
-#### VPC 설정 예시
-
-```bash
-agentcore add harness --name internal-agent \
-  --network-mode VPC \
-  --subnets subnet-0abc1234def56789a \
-  --security-groups sg-0abc1234def56789a
-agentcore deploy
-```
-
-#### Inbound OAuth 설정 예시
-
-```bash
-agentcore add harness --name MyNewHarness \
-  --authorizer-type CUSTOM_JWT \
-  --discovery-url {DISCOVERY_URL} \
-  --allowed-clients {CLIENT_ID}
-agentcore deploy
-
-# Bearer 토큰으로 호출
-agentcore invoke --harness MyNewHarness --bearer-token "{token}" "Hello"
-```
-
----
-
-## 빠른 시작
-
-### Prerequisites
-
-- AWS 자격증명 (프리뷰 리전 중 하나)
-- **CLI**: Node.js 20+
-- **SDK**: Python 3.10+, boto3, IAM 실행 역할
-
-### AgentCore CLI 방식
-
-```bash
-# 1. CLI 설치
-npm install -g @aws/agentcore@preview
-
-# 2. 하네스 생성 (non-interactive)
-agentcore create --name myresearchagent --model-provider bedrock
-
-# 3. 배포
-agentcore deploy
-
-# 4. 호출
-agentcore invoke --harness myresearchagent \
-  --session-id "$(uuidgen)" \
-  "Research three tropical vacation options under $3k, within five hours of NYC."
-```
 
 ### Python SDK (boto3) 방식
+
+
+#### invoke_harness 
 
 ```python
 import boto3
@@ -454,44 +365,113 @@ for event in response["stream"]:
         print(f"\nError: {event['runtimeClientError']['message']}")
 ```
 
----
 
-## API 목록
+#### 직접 셸 접근 (InvokeAgentRuntimeCommand)
 
-| API | 설명 |
+모델 추론 없이, 토큰 비용 없이 microVM에 직접 셸 접근 가능.
+
+```python
+runtime = boto3.client("bedrock-agentcore", region_name="us-west-2")
+
+response = runtime.invoke_agent_runtime_command(
+    agentRuntimeArn=HARNESS_ARN,
+    runtimeSessionId=SESSION_ID,
+    body={"command": "pip install pandas && ls -la /workspace"},
+)
+
+for event in response["stream"]:
+    chunk = event.get("chunk", {})
+    if "contentDelta" in chunk:
+        delta = chunk["contentDelta"]
+        if "stdout" in delta:
+            print(delta["stdout"], end="", flush=True)
+        if "stderr" in delta:
+            print(delta["stderr"], end="", flush=True)
+    elif "contentStop" in chunk:
+        print(f"\n[exit code: {chunk['contentStop']['exitCode']}]")
+```
+
+
+
+### 📤 응답 구조
+
+```python
+response = control.create_harness(...)
+harness = response["harness"]
+```
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `harnessId` | string | 하네스 ID |
+| `harnessName` | string | 하네스 이름 |
+| `arn` | string | 하네스 ARN |
+| `status` | string | `CREATING` → `READY` (또는 `CREATE_FAILED`) |
+| `executionRoleArn` | string | 실행 역할 ARN |
+| `createdAt` | datetime | 생성 시각 |
+| `updatedAt` | datetime | 최종 수정 시각 |
+| `failureReason` | string | 실패 시 사유 |
+
+**status 전체 값:**
+`CREATING` · `CREATE_FAILED` · `UPDATING` · `UPDATE_FAILED` · `READY` · `DELETING` · `DELETE_FAILED`
+
+#### READY 상태까지 폴링하기
+
+```python
+import time
+
+def wait_for_harness_ready(control, harness_id, timeout=120):
+    for _ in range(timeout // 5):
+        res = control.get_harness(harnessId=harness_id)
+        status = res["harness"]["status"]
+        print(f"Status: {status}")
+        if status == "READY":
+            return res["harness"]
+        if "FAILED" in status:
+            raise RuntimeError(f"Harness 생성 실패: {res['harness'].get('failureReason')}")
+        time.sleep(5)
+    raise TimeoutError("Harness READY 대기 시간 초과")
+
+harness = wait_for_harness_ready(control, response["harness"]["harnessId"])
+print(f"Harness ARN: {harness['arn']}")
+```
+
+### 🔁 예외 처리
+
+```python
+from botocore.exceptions import ClientError
+
+try:
+    response = control.create_harness(
+        harnessName="MyAgent",
+        executionRoleArn="arn:aws:iam::123456789012:role/MyHarnessRole"
+    )
+except ClientError as e:
+    code = e.response["Error"]["Code"]
+    if code == "ConflictException":
+        print("같은 이름의 하네스가 이미 존재합니다.")
+    elif code == "ServiceQuotaExceededException":
+        print("서비스 할당량을 초과했습니다.")
+    elif code == "AccessDeniedException":
+        print("IAM 권한이 부족합니다.")
+    elif code == "ValidationException":
+        print(f"파라미터 검증 오류: {e.response['Error']['Message']}")
+    elif code == "ThrottlingException":
+        print("요청이 제한되었습니다. 잠시 후 재시도하세요.")
+    else:
+        raise
+```
+
+| 예외 | 설명 |
 |---|---|
-| `CreateHarness` | 하네스 생성 |
-| `GetHarness` | 하네스 정보 조회 |
-| `UpdateHarness` | 하네스 업데이트 |
-| `DeleteHarness` | 하네스 삭제 |
-| `ListHarnesses` | 하네스 목록 조회 |
-| `InvokeHarness` | 에이전트 호출 (스트리밍 응답) |
-| `InvokeAgentRuntimeCommand` | 직접 셸 명령 실행 |
+| `ServiceQuotaExceededException` | 계정 할당량 초과 |
+| `AccessDeniedException` | IAM 권한 부족 |
+| `ConflictException` | 동일 이름 하네스 이미 존재 |
+| `ValidationException` | 파라미터 유효성 오류 |
+| `ThrottlingException` | 요청 스로틀링 |
+| `InternalServerException` | AWS 내부 오류 |
 
-### InvokeHarness 스트리밍 이벤트 타입
 
-| 이벤트 | 설명 |
-|---|---|
-| `messageStart` | 새 메시지 시작 (role 포함) |
-| `contentBlockStart` | 콘텐츠 블록 시작 (text, toolUse, toolResult) |
-| `contentBlockDelta` | 증분 콘텐츠 |
-| `contentBlockStop` | 콘텐츠 블록 종료 |
-| `messageStop` | 메시지 종료 (stopReason 포함) |
-| `metadata` | 토큰 사용량 및 지연 시간 메트릭 |
-| `runtimeClientError` | 실행 중 오류 |
 
-### stopReason 값
-
-| 값 | 의미 |
-|---|---|
-| `end_turn` | 에이전트 정상 종료 |
-| `tool_use` | 인라인 함수 호출 대기 |
-| `max_tokens` | 턴당 토큰 한도 도달 |
-| `max_iterations_exceeded` | maxIterations 한도 초과 |
-| `timeout_exceeded` | timeoutSeconds 한도 초과 |
-| `max_output_tokens_exceeded` | maxTokens 예산 소진 |
-
----
 
 ## 관련 문서
 
