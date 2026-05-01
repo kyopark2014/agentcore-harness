@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import sys
+import time
 import uuid
 from typing import Optional
 
@@ -36,6 +37,10 @@ HARNESS_CONFIG_KEYS = (
 )
 
 IAM_ROLE_NAME_MAX = 64
+
+# Poll after DeleteHarness / DeleteMemory until the resource is gone (or terminal failure).
+DELETE_WAIT_TIMEOUT_SEC = int(os.environ.get("AGENTCORE_DELETE_WAIT_TIMEOUT_SEC", "600"))
+DELETE_POLL_INTERVAL_SEC = float(os.environ.get("AGENTCORE_DELETE_POLL_INTERVAL_SEC", "5"))
 
 
 def load_config(config_path: str) -> dict:
@@ -143,7 +148,7 @@ def delete_harness_resource(control, harness_id: str) -> bool:
             harnessId=harness_id,
             clientToken=str(uuid.uuid4()),
         )
-        logger.info(f"Deleted harness: {harness_id}")
+        logger.info(f"DeleteHarness accepted: {harness_id}")
         return True
     except ClientError as e:
         code = e.response["Error"]["Code"]
@@ -154,13 +159,42 @@ def delete_harness_resource(control, harness_id: str) -> bool:
         return False
 
 
+def wait_until_harness_deleted(control, harness_id: str) -> bool:
+    """Poll get_harness until ResourceNotFoundException or timeout."""
+    deadline = time.monotonic() + DELETE_WAIT_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        try:
+            h = control.get_harness(harnessId=harness_id)["harness"]
+            status = h.get("status")
+            if status == "DELETE_FAILED":
+                reason = h.get("failureReason")
+                logger.error(
+                    f"Harness deletion failed: harnessId={harness_id}, "
+                    f"failureReason={reason!r}"
+                )
+                return False
+            logger.info(
+                f"Harness delete in progress: harnessId={harness_id}, status={status!r}"
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                logger.info(f"Harness delete complete (not found): {harness_id}")
+                return True
+            raise
+        time.sleep(DELETE_POLL_INTERVAL_SEC)
+    logger.error(
+        f"Timeout waiting for harness deletion after {DELETE_WAIT_TIMEOUT_SEC}s: {harness_id}"
+    )
+    return False
+
+
 def delete_memory_resource(control, memory_id: str) -> bool:
     try:
         control.delete_memory(
             memoryId=memory_id,
             clientToken=str(uuid.uuid4()),
         )
-        logger.info(f"DeleteMemory accepted for: {memory_id}")
+        logger.info(f"DeleteMemory accepted: {memory_id}")
         return True
     except ClientError as e:
         code = e.response["Error"]["Code"]
@@ -169,6 +203,35 @@ def delete_memory_resource(control, memory_id: str) -> bool:
             return True
         logger.error(f"DeleteMemory failed: {e}")
         return False
+
+
+def wait_until_memory_deleted(control, memory_id: str) -> bool:
+    """Poll get_memory until ResourceNotFoundException or timeout."""
+    deadline = time.monotonic() + DELETE_WAIT_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        try:
+            m = control.get_memory(memoryId=memory_id)["memory"]
+            status = m.get("status")
+            if status == "DELETE_FAILED":
+                reason = m.get("failureReason")
+                logger.error(
+                    f"Memory deletion failed: memoryId={memory_id}, "
+                    f"failureReason={reason!r}"
+                )
+                return False
+            logger.info(
+                f"Memory delete in progress: memoryId={memory_id}, status={status!r}"
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                logger.info(f"Memory delete complete (not found): {memory_id}")
+                return True
+            raise
+        time.sleep(DELETE_POLL_INTERVAL_SEC)
+    logger.error(
+        f"Timeout waiting for memory deletion after {DELETE_WAIT_TIMEOUT_SEC}s: {memory_id}"
+    )
+    return False
 
 
 def delete_iam_role_like_uninstaller(iam, role_name: str) -> None:
@@ -246,10 +309,14 @@ def main() -> None:
     harness_ok = (
         delete_harness_resource(control, harness_id) if harness_id else True
     )
+    if harness_id and harness_ok:
+        harness_ok = wait_until_harness_deleted(control, harness_id)
     if not harness_id:
         logger.info("No harness id resolved; skipping DeleteHarness.")
 
     memory_ok = delete_memory_resource(control, memory_id) if memory_id else True
+    if memory_id and memory_ok:
+        memory_ok = wait_until_memory_deleted(control, memory_id)
     if not memory_id:
         logger.info("No memory id resolved; skipping DeleteMemory.")
 

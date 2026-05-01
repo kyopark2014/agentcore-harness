@@ -46,13 +46,17 @@ def _memory_id_from_arn(memory_arn: str) -> str | None:
 
 
 def resolve_account_id(cfg: dict) -> str:
+    """
+    Always return a string account id. JSON may store accountId as a number; IAM
+    trust conditions require quoted string values in policy JSON.
+    """
     account_id = cfg.get("accountId")
-    if account_id:
-        return account_id
+    if account_id is not None and str(account_id).strip() != "":
+        return str(account_id).strip()
     sts = boto3.client("sts")
     account_id = sts.get_caller_identity()["Account"]
     cfg["accountId"] = account_id
-    return account_id
+    return str(account_id).strip()
 
 
 def create_or_get_harness_execution_role(
@@ -157,6 +161,7 @@ def create_or_get_agentcore_memory_role(
     aws:SourceAccount and aws:SourceArn (ArnLike); CreateMemory rejects
     a role without this trust shape (ValidationException).
     """
+    account_id = str(account_id).strip()
     role_name = f"role-agentcore-memory-for-{project_name}-{region}"
     iam_role_name_max = 64
     if len(role_name) > iam_role_name_max:
@@ -237,6 +242,9 @@ def create_or_get_agentcore_memory_role(
         PolicyDocument=json.dumps(memory_policy),
     )
     logger.info(f"Attached/updated AgentCore Memory inline policy on {role_name}")
+
+    # CreateMemory validates the role soon after IAM updates; brief pause helps propagation.
+    time.sleep(2)
 
     return role_arn
 
@@ -384,28 +392,60 @@ def ensure_agent_memory_arn(
     from agentcore_memory import USER_PREFERENCE_PROMPT
 
     namespace = f"/users/{memory_token}"
-    result = memory_client.create_memory_and_wait(
-        name=memory_token,
-        description=f"Memory for {project_name}",
-        event_expiry_days=365,
-        strategies=[
-            {
-                "customMemoryStrategy": {
-                    "name": memory_token,
-                    "namespaces": [namespace],
-                    "configuration": {
-                        "userPreferenceOverride": {
-                            "extraction": {
-                                "modelId": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-                                "appendToPrompt": USER_PREFERENCE_PROMPT,
-                            }
+    _memory_creation_attempts = 6
+    result = None
+    for attempt in range(_memory_creation_attempts):
+        try:
+            result = memory_client.create_memory_and_wait(
+                name=memory_token,
+                description=f"Memory for {project_name}",
+                event_expiry_days=365,
+                strategies=[
+                    {
+                        "customMemoryStrategy": {
+                            "name": memory_token,
+                            "namespaces": [namespace],
+                            "configuration": {
+                                "userPreferenceOverride": {
+                                    "extraction": {
+                                        "modelId": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                                        "appendToPrompt": USER_PREFERENCE_PROMPT,
+                                    }
+                                }
+                            },
                         }
-                    },
-                }
-            }
-        ],
-        memory_execution_role_arn=memory_exec_role,
-    )
+                    }
+                ],
+                memory_execution_role_arn=memory_exec_role,
+            )
+            break
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            msg = (e.response.get("Error", {}).get("Message") or "").lower()
+            if code != "ValidationException" or not (
+                "trust" in msg or "valid trust" in msg
+            ):
+                raise
+            if attempt >= _memory_creation_attempts - 1:
+                raise
+            wait_sec = 3 * (attempt + 1)
+            logger.warning(
+                "CreateMemory trust validation failed (attempt %s/%s); "
+                "re-syncing memory role and waiting %ss. Error: %s",
+                attempt + 1,
+                _memory_creation_attempts,
+                wait_sec,
+                e.response.get("Error", {}).get("Message"),
+            )
+            time.sleep(wait_sec)
+            memory_exec_role = create_or_get_agentcore_memory_role(
+                iam=iam_local,
+                project_name=project_name,
+                region=bedrock_region,
+                account_id=account_id_mem,
+            )
+    if result is None:
+        raise RuntimeError("create_memory_and_wait returned no result")
     logger.info(f"create_memory_and_wait result: {result}")
 
     mem_id = result.get("id")
@@ -556,18 +596,6 @@ def main() -> None:
         region_name=bedrock_region,
     )
 
-    # Stdio MCP client block (awslabs.aws-documentation-mcp-server). HarnessTool.config cannot
-    # include mcpServers (boto3 union); deploy it for the runtime via MCP_SERVERS_JSON.
-    aws_docs_mcp_stdio_client = {
-        "mcpServers": {
-            "awslabs.aws-documentation-mcp-server": {
-                "command": "uvx",
-                "args": ["awslabs.aws-documentation-mcp-server@latest"],
-                "env": {"FASTMCP_LOG_LEVEL": "ERROR"},
-            }
-        }
-    }
-
     existing = find_harness_by_api_name(control, harness_api_name)
     if existing:
         harness_id = existing["harnessId"]
@@ -594,6 +622,15 @@ def main() -> None:
                         "config": {"remoteMcp": {"url": "https://mcp.exa.ai/mcp"}},
                     },
                     {
+                        "type": "remote_mcp",
+                        "name": "aws_knowledge",
+                        "config": {
+                            "remoteMcp": {
+                                "url": "https://knowledge-mcp.global.api.aws",
+                            }
+                        },
+                    },
+                    {
                         "type": "agentcore_browser",
                         "name": "browser",
                         "config": {"agentCoreBrowser": {}},
@@ -603,7 +640,6 @@ def main() -> None:
                         "name": "code",
                         "config": {"agentCoreCodeInterpreter": {}},
                     },
-                    # AWS docs stdio MCP: aws_docs_mcp_stdio_client -> MCP_SERVERS_JSON env below.
                 ],
                 memory={
                     "agentCoreMemoryConfiguration": {
@@ -630,7 +666,6 @@ def main() -> None:
                 },
                 environmentVariables={
                     "LOG_LEVEL": "info",
-                    "MCP_SERVERS_JSON": json.dumps(aws_docs_mcp_stdio_client),
                 },
                 tags={"Project": project_name, "Env": "dev"},
             )
