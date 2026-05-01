@@ -2,37 +2,17 @@
 
 AgentCore의 관리형 에이전트 하네스(Managed Agent Harness) 는 이 모든 사전 구축 작업을 단순한 설정(configuration) 으로 대체할 수 있습니다.
 
-## 아키텍처 특징
+## 주요 특징
 
-### 격리된 microVM 실행
+AgentCore Harness는 격리된 microVM으로 실행됩니다.
 
 - 모든 세션이 보안 격리된 Firecracker microVM에서 실행
 - 세션별 독립 파일시스템 & 셸 보유
 - 기본적으로 Stateful 세션 간 상태 유지
 
-### 모델 (Amazon Bedrock)
-
-- 이 저장소의 `deployment/create_harness.py`는 Amazon Bedrock Inference Profile을 사용합니다.
-
-본 저장소 배포 기본값
-
-- 모델 ID: `global.anthropic.claude-opus-4-7`
-
-### Agent
+이 저장소에서는 `deployment/create_harness.py`와 같이 Amazon Bedrock Inference Profile을 사용합니다.
 
 AWS 오픈소스 에이전트 프레임워크인 [Strands Agents](https://strandsagents.com/docs/user-guide/quickstart/python/) 로 구동됩니다.
-
-### AWS 문서 기준 Harness 요약
-
-Amazon Bedrock AgentCore 개발자 가이드에서 관리형 Harness는 모델·지시문·도구 등을 선언하면 에이전트 오케스트레이션 루프와 실행 환경(격리 microVM, 도구·메모리·네트워크·신원·관측)을 AgentCore가 구성하는 방식으로 설명됩니다.
-
-- `InvokeHarness`의 `runtimeSessionId`는 최소 33자(UUID 등). 같은 값으로 재호출하면 동일 세션 환경에서 대화를 이어갈 수 있습니다.
-
-- [AgentCore Harness (개요)](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness.html)
-- [Harness 시작하기](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-get-started.html)
-- [Harness 실행 역할 정책](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-security.html#harness-execution-role-policy)
-- [AgentCore Observability](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability.html)
-
 
 ## 주요 기능
 
@@ -55,83 +35,13 @@ Amazon Bedrock AgentCore 개발자 가이드에서 관리형 Harness는 모델·
 
 > 참고: AgentCore Harness가 노출하는 내장 도구 구성은 제품 버전·설정에 따라 다를 수 있습니다. `deployment/create_harness.py`는 `tools`에 원격 MCP 2개(Exa, AWS Knowledge)와 Browser·Code Interpreter만 선언하며, `shell` 등을 따로 추가하지는 않습니다.
 
-`allowedTools` 파라미터로 허용 도구 제어 가능합니다.
-
-| 패턴 | 예시 | 매칭 |
-|---|---|---|
-| `*` | `"*"` | 모든 도구 |
-| Plain name | `"shell"` | 내장 도구 이름 |
-| `@builtin` | `"@builtin"` | 모든 내장 도구 |
-| `@server` | `"@git"` | MCP 서버의 모든 도구 |
-| `@server/tool` | `"@git/git_status"` | 특정 MCP 도구 |
 
 
-
-## 이 저장소: `deployment/create_harness.py`가 하는 일
-
-`deployment/config.json`을 읽어 AgentCore Memory와 Harness를 맞춰 둡니다. (`bedrock-agentcore-control`, IAM, `bedrock_agentcore.memory.MemoryClient` 사용.)
-
-### 설정 파일
-
-- 경로: `deployment/config.json`
-- 주요 키: `region`, `projectName` (기본값 예: `agent-harness`), 선택 `accountId` (문자열 권장), 이후 스크립트가 채움: `executionRoleArn`, `agentcore_memory_role`, `agent_memory_arn`, `harnessId`, `HARNESS_ARN`. 셸 전용 호출에는 선택적으로 `agentRuntimeArn` 을 넣을 수 있습니다(`deployment/execute_command_harness.py`가 `agentRuntimeArn` 없으면 `HARNESS_ARN` 으로 폴백).
-
-### Harness 이름 규칙
-
-- API `harnessName` = `projectName`에서 하이픈(`-`)을 언더스코어(`_`)로 치환한 값
-- 패턴: `[a-zA-Z][a-zA-Z0-9_]{0,39}` (하이픈 불가)
-
-### IAM 역할
-
-| 용도 | 역할 이름 패턴 |
-|------|----------------|
-| Harness 실행 | `role-harness-for-{projectName}-{region}` |
-| AgentCore Memory 실행 | `role-agentcore-memory-for-{projectName}-{region}` |
-
-- Harness 실행 역할 trust: `bedrock-agentcore.amazonaws.com`만 (`SourceAccount` 조건 없음 — CreateHarness 검증과 맞춤).
-- Memory 실행 역할 trust: 동일 서비스 + `aws:SourceAccount`, `aws:SourceArn` (`arn:aws:bedrock-agentcore:{region}:{account}:*`) — CreateMemory 검증용.
-
-### AgentCore Memory
-
-- 이름 토큰: `projectName`의 `-` → `_` (예: `agent-harness` → `agent_harness`)
-- `agent_memory_arn`이 없으면: 제어 플레인에서 메모리 목록을 보고 동일 접두 ID가 있으면 재사용, 없으면 custom memory strategy(user preference 추출)로 생성. 추출 모델은 스크립트에 정의된 Bedrock 모델 ID 사용 (`deployment/agentcore_memory`의 프롬프트 참조).
-- CreateMemory가 trust 검증으로 실패할 때: IAM 전파 여유를 두기 위해 짧은 대기·재시도 로직이 있습니다.
-
-### CreateHarness 인자(이 레포가 넘기는 값)
-
-- `model.bedrockModelConfig`: `modelId` = `global.anthropic.claude-opus-4-7`, `maxTokens` = 위 헬퍼 값
-- `systemPrompt`: 한국어/에이전트 워크플로 설명 텍스트 (`BASE_SYSTEM_PROMPT`)
-- `tools` (실제 4개):
-  - `remote_mcp` exa — `https://mcp.exa.ai/mcp`
-  - `remote_mcp` aws_knowledge — `https://knowledge-mcp.global.api.aws` ([AWS Knowledge MCP Server](https://awslabs.github.io/mcp/servers/aws-knowledge-mcp-server))
-  - `agentcore_browser` browser
-  - `agentcore_code_interpreter` code
-- `memory.agentCoreMemoryConfiguration.arn`: 위에서 확보한 Memory ARN
-- `truncation`: sliding window, `messagesCount` 50
-- `maxIterations` 20, `maxTokens` 50000, `timeoutSeconds` 300
-- `environment.agentCoreRuntimeEnvironment`: 퍼블릭 네트워크, 세션 타임아웃 등
-- `environmentVariables`: `LOG_LEVEL` = `info` 만 설정 (stdio MCP용 `MCP_SERVERS_JSON` 등은 사용하지 않음)
-- `skills` 배열은 이 스크립트에서 설정하지 않습니다.
-
-### 이미 Harness가 있을 때
-
-- 같은 `harnessName`이 있으면 CreateHarness를 호출하지 않고 기존 `harnessId`를 사용합니다. tools/모델 변경만 코드로 반영하려면 콘솔에서 Harness를 수정하거나 `UpdateHarness` API로 전체 `tools` 등을 다시 넘겨야 합니다.
-- Memory ARN이 바뀌었으면 `ensure_harness_memory_binding`으로 `update_harness`에 가까운 방식으로 메모리만 맞춥니다.
-
-### 완료 후
-
-- `get_harness`로 최대 약 2분(24×5초)까지 `READY` 폴링
-- `deployment/config.json`에 `harnessId`, `HARNESS_ARN` 저장
-
-
-
-## boto3로 배포하기
+## 배포하기
 
 ### create_harness
 
-> [!note] 클라이언트 구분
-> - Control Plane (`bedrock-agentcore-control`): 하네스 생성/수정/삭제 등 관리 작업
-> - Data Plane (`bedrock-agentcore`): 하네스 호출 (InvokeHarness)
+[create_harness.py](./deployment/create_harness.py)와 같이 AgentCore Harness에 따라 Agent를 배포합니다. 이를 위해 아래처럼 bedrock-agentcore-control으로 client로 정의합니다.
 
 ```python
 import boto3
@@ -626,8 +536,6 @@ except ClientError as e:
 
 ## 관련 문서
 
-### Amazon Bedrock AgentCore (Harness)
-
 [AgentCore Harness 개요](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness.html)
 
 [Harness 시작하기](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-get-started.html)
@@ -640,10 +548,16 @@ except ClientError as e:
 
 [Strands Agents](https://strandsagents.com/)
 
-### Boto3 API
-
 [Boto3 - Create Harness](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore-control/client/create_harness.html)
 
 [Boto3 - Invoke Harness](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore/client/invoke_harness.html)
 
 [Boto3 - invoke_agent_runtime_command](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore/client/invoke_agent_runtime_command.html)
+
+[AgentCore Harness (개요)](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness.html)
+
+[Harness 시작하기](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-get-started.html)
+
+[Harness 실행 역할 정책](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-security.html#harness-execution-role-policy)
+
+[AgentCore Observability](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability.html)
