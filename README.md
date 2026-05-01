@@ -17,13 +17,21 @@ AgentCore의 관리형 에이전트 하네스(Managed Agent Harness) 는 이 모
 본 저장소 배포 기본값
 
 - 모델 ID: `global.anthropic.claude-opus-4-7`
-- `CreateHarness`의 `maxTokens`: `get_max_output_tokens(model_id)` (이 모델은 128000)
 
-### Strands Agents 기반
+### Agent
 
-AWS 오픈소스 에이전트 프레임워크인 [[Strands Agents]] 로 구동
+AWS 오픈소스 에이전트 프레임워크인 [Strands Agents](https://strandsagents.com/docs/user-guide/quickstart/python/) 로 구동됩니다.
 
+### AWS 문서 기준 Harness 요약
 
+Amazon Bedrock AgentCore 개발자 가이드에서 관리형 Harness는 모델·지시문·도구 등을 선언하면 에이전트 오케스트레이션 루프와 실행 환경(격리 microVM, 도구·메모리·네트워크·신원·관측)을 AgentCore가 구성하는 방식으로 설명됩니다.
+
+- `InvokeHarness`의 `runtimeSessionId`는 최소 33자(UUID 등). 같은 값으로 재호출하면 동일 세션 환경에서 대화를 이어갈 수 있습니다.
+
+- [AgentCore Harness (개요)](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness.html)
+- [Harness 시작하기](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-get-started.html)
+- [Harness 실행 역할 정책](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-security.html#harness-execution-role-policy)
+- [AgentCore Observability](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability.html)
 
 
 ## 주요 기능
@@ -115,7 +123,7 @@ AWS 오픈소스 에이전트 프레임워크인 [[Strands Agents]] 로 구동
 - `get_harness`로 최대 약 2분(24×5초)까지 `READY` 폴링
 - `deployment/config.json`에 `harnessId`, `HARNESS_ARN` 저장
 
----
+
 
 ## boto3로 배포하기
 
@@ -135,13 +143,13 @@ control = boto3.client("bedrock-agentcore-control", region_name="us-west-2")
 
 | API | 설명 |
 |---|---|
-| `CreateHarness` | 하네스 생성 |
-| `GetHarness` | 하네스 정보 조회 |
-| `UpdateHarness` | 하네스 업데이트 |
-| `DeleteHarness` | 하네스 삭제 |
-| `ListHarnesses` | 하네스 목록 조회 |
-| `InvokeHarness` | 에이전트 호출 (스트리밍 응답) |
-| `InvokeAgentRuntimeCommand` | 직접 셸 명령 실행 |
+| [`CreateHarness`](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore-control/client/create_harness.html) | 하네스 생성 |
+| [`GetHarness`](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore-control/client/get_harness.html) | 하네스 정보 조회 |
+| [`UpdateHarness`](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore-control/client/update_harness.html) | 하네스 업데이트 |
+| [`DeleteHarness`](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore-control/client/delete_harness.html) | 하네스 삭제 |
+| [`ListHarnesses`](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore-control/client/list_harnesses.html) | 하네스 목록 조회 |
+| [`InvokeHarness`](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore/client/invoke_harness.html) | 에이전트 호출 (스트리밍 응답) |
+| [`InvokeAgentRuntimeCommand`](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore/client/invoke_agent_runtime_command.html) | 직접 셸 명령 실행 |
 
 ### InvokeHarness 스트리밍 이벤트 타입
 
@@ -149,7 +157,7 @@ control = boto3.client("bedrock-agentcore-control", region_name="us-west-2")
 |---|---|
 | `messageStart` | 새 메시지 시작 (role 포함) |
 | `contentBlockStart` | 콘텐츠 블록 시작 (text, toolUse, toolResult) |
-| `contentBlockDelta` | 증분 콘텐츠 |
+| `contentBlockDelta` | 증분 콘텐츠. AWS 문서 기준 `text`, `toolUse` 입력, `reasoningContent` 등 |
 | `contentBlockStop` | 콘텐츠 블록 종료 |
 | `messageStop` | 메시지 종료 (stopReason 포함) |
 | `metadata` | 토큰 사용량 및 지연 시간 메트릭 |
@@ -177,6 +185,8 @@ control = boto3.client("bedrock-agentcore-control", region_name="us-west-2")
 
 ### 최소 생성 예시
 
+`deployment/config.json`에서 `projectName`과 `region`을 설정합니다.
+
 ```python
 response = control.create_harness(
     harnessName="MyResearchAgent",
@@ -198,13 +208,11 @@ print(f"Status      : {harness['status']}")  # CREATING → READY
 아래와 같이 모델을 설정합니다.
 
 ```python
-# Amazon Bedrock
+# deployment/create_harness.py와 동일: Inference Profile + get_max_output_tokens(model_id) → 128000
 model={
     "bedrockModelConfig": {
-        "modelId": "anthropic.claude-sonnet-4-5",  # [REQUIRED]
-        "maxTokens": 4096,      # 모델 호출당 최대 생성 토큰
-        "temperature": 0.7,
-        "topP": 0.9
+        "modelId": "global.anthropic.claude-opus-4-7",
+        "maxTokens": 128000,
     }
 }
 ```
@@ -212,8 +220,9 @@ model={
 시스템 프롬프트를 설정합니다.
 
 ```python
+# deployment/create_harness.py 의 BASE_SYSTEM_PROMPT 요약 (한국어·에이전트 워크플로 안내 전문은 스크립트 참고)
 systemPrompt=[
-    {"text": "You are a helpful research assistant specializing in travel."}
+    {"text": "당신의 이름은 서연이고, 질문에 친근한 방식으로 대답하도록 설계된 대화형 AI입니다.\n한국어로 답변하세요.\n..."}
 ]
 ```
 
@@ -229,9 +238,10 @@ skills=[
 필요시 태그 (`tags`)를 설정합니다.
 
 ```python
+# create_harness.py 가 넘기는 태그
 tags={
-    "Project": "MyAIProject",
-    "Env": "prod"
+    "Project": "agent-harness",
+    "Env": "dev",
 }
 ```
 
@@ -261,9 +271,9 @@ IAM 권한 모델:
 > 사용자별 자격증명 범위가 필요하면 Inbound OAuth 설정 필요. SigV4 per-user identity 지원은 향후 릴리스 예정.
 
 
-### 도구 설정 (`tools`) — API 일반 예시
+### 도구 설정 (`tools`) — 이 저장소(`create_harness.py`) 구성
 
-아래는 Boto3 `CreateHarness`가 허용하는 도구 타입 예시입니다. 이 저장소의 `create_harness.py`는 위 섹션에 적은 4개 도구만 연결합니다 (Gateway·inline_function 등은 포함하지 않음).
+Gateway·inline_function 등 다른 타입은 `CreateHarness` API에서 지원하지만, 이 스크립트는 아래 네 가지만 연결합니다.
 
 ```python
 tools=[
@@ -460,7 +470,7 @@ response = runtime.invoke_agent_runtime_command(
     contentType="application/json",
     accept="application/json",
     runtimeSessionId="1234abcd-12ab-34cd-56ef-1234567890ab",
-    agentRuntimeArn="arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/...",  # Harness ARN 아님
+    agentRuntimeArn=AGENT_RUNTIME_ARN,
     body={
         "command": "python3 -m pip install pandas && ls -la /workspace",
         "timeout": 300,
@@ -532,7 +542,7 @@ from botocore.exceptions import ClientError
 
 try:
     response = control.create_harness(
-        harnessName="MyAgent",
+        harnessName="agent_harness",
         executionRoleArn="arn:aws:iam::123456789012:role/MyHarnessRole"
     )
 except ClientError as e:
@@ -590,7 +600,8 @@ except ClientError as e:
 
 ### 사전 준비
 
-- Python 3 환경, AWS 자격증명(프로파일 또는 환경 변수) 및 AgentCore·Bedrock·IAM 권한
+- AWS Harness 시작 가이드는 boto3/SDK 사용 시 Python 3.10 이상을 전제로 합니다. 로컬 UI·스크립트도 가능한 한 그에 맞추는 것이 좋습니다.
+- AWS 자격증명(프로파일 또는 환경 변수) 및 AgentCore·Bedrock·IAM 권한
 - Python 패키지 예: `boto3`, `botocore`, 배포 스크립트용 `bedrock_agentcore`(패키지 이름은 AWS 배포 가이드에 따름), UI용 `streamlit`, `requests`, `langchain-aws`
 
 ### 권장 실행 순서
@@ -614,6 +625,22 @@ except ClientError as e:
 ```
 
 ## 관련 문서
+
+### Amazon Bedrock AgentCore (Harness)
+
+[AgentCore Harness 개요](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness.html)
+
+[Harness 시작하기](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-get-started.html)
+
+[AgentCore 요금](https://aws.amazon.com/bedrock/agentcore/pricing/)
+
+[AgentCore Observability](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability.html)
+
+[Harness 보안 및 액세스 제어](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-security.html)
+
+[Strands Agents](https://strandsagents.com/)
+
+### Boto3 API
 
 [Boto3 - Create Harness](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore-control/client/create_harness.html)
 
