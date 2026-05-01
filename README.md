@@ -504,6 +504,38 @@ except ClientError as e:
 `application/.gitignore`에 `config.json`이 있어 UI용 설정은 저장소에 없을 수 있습니다.
 
 
+## 설치하기
+
+아래 명령어로 실행합니다.
+
+```bash
+python deployment/create_harness.py
+```
+
+Streamlit으로 실행은 아래와 같습니다.
+
+```python
+streamlit run application/app.py
+```
+
+Agent의 삭제는 아래 명령어로 수행합니다.
+
+```python
+python deployment/delete_harness.py
+```
+
+## 실행하기
+
+실행 결과는 아래와 같습니다. AgentCore Harness로 배포시에도 tool 정보를 아래와 같이 알수 있습니다.
+
+<img width="700" alt="image" src="https://github.com/user-attachments/assets/92668d53-9d29-4450-a0f6-bb4cef39ec5b" />
+
+이때의 결과는 아래와 같습니다.
+
+<img width="700" alt="image" src="https://github.com/user-attachments/assets/a1cad40e-a68b-4e4d-a423-9c1736f6c6ce" />
+
+
+
 
 ### UI에서 요청이 흐르는 방식
 
