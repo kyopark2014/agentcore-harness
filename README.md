@@ -16,80 +16,56 @@ AWS 오픈소스 에이전트 프레임워크인 [Strands Agents](https://strand
 
 ## Operation Architecture
 
-이 저장소는 로컬에서 Strands SDK를 직접 실행하지 않습니다. `deployment/create_harness.py`로 **AgentCore Harness**를 프로비저닝하고, Streamlit UI는 Data Plane `InvokeHarness`로 원격 Harness를 호출합니다. Harness 런타임 내부는 [Strands Agents](https://strandsagents.com/docs/user-guide/quickstart/python/) 기반 에이전트 루프입니다.
+로컬 UI는 Strands SDK를 직접 실행하지 않습니다. `create_harness.py`가 Control Plane에서 Harness를 정의하고, `run_harness`가 Data Plane `InvokeHarness`로 그 Harness를 호출합니다. Harness 런타임은 Firecracker microVM 안에서 Strands 에이전트 루프를 돌며 Bedrock·Memory·도구를 사용합니다.
 
 ```mermaid
 flowchart TB
-  subgraph UI["Streamlit (application/app.py)"]
-    Chat[Chat Input / History]
-    NQ[NotificationQueue · st.status]
+  CH[create_harness.py] -->|CreateHarness| H[AgentCore Harness]
+  CH --> Mem[AgentCore Memory]
+  Mem --> H
+
+  App[app.py] --> RH[run_harness]
+  RH -->|invoke_harness<br/>runtimeSessionId · actorId| H
+
+  subgraph Harness["Harness 런타임 (microVM)"]
+    Loop[Strands agent loop<br/>maxIterations · timeout]
+    Model[Inference Profile → Bedrock]
+    SP[systemPrompt]
+    MemUse[Memory read/write]
+    BuiltIn[shell · file_operations]
+    Remote[remote_mcp · browser · code]
+    Loop --> Model
+    Loop --> SP
+    Loop --> MemUse
+    Loop --> BuiltIn
+    Loop --> Remote
   end
 
-  subgraph Client["application/agentcore_client.py"]
-    RH[run_harness]
-    Resolve[HARNESS_ARN 해석<br/>config.json / ListHarnesses]
-    Parse[스트림 파싱<br/>text · toolUse · toolResult]
-  end
-
-  subgraph Control["Control Plane (bedrock-agentcore-control)"]
-    CH[CreateHarness / GetHarness<br/>deployment/create_harness.py]
-    Mem[AgentCore Memory]
-  end
-
-  subgraph DataPlane["Data Plane (bedrock-agentcore)"]
-    IH[invoke_harness]
-  end
-
-  subgraph Harness["AgentCore Harness (Firecracker microVM)"]
-    SP[systemPrompt + Inference Profile]
-    Loop[Agent loop · maxIterations]
-    BuiltIn["Built-in: shell · file_operations"]
-  end
-
-  subgraph Tools["Harness Tools (create_harness.py)"]
-    Exa[remote_mcp: exa]
-    AWS[remote_mcp: aws_knowledge]
-    Browser[agentcore_browser]
-    Code[agentcore_code_interpreter]
-  end
-
-  subgraph Bedrock["Amazon Bedrock"]
-    IP[Inference Profile]
-    BR[Bedrock Runtime]
-  end
-
-  Chat --> RH
-  RH --> NQ
-  RH --> Resolve
-  Resolve --> CH
-  RH --> IH
-  IH --> Harness
-  Harness --> SP
-  SP --> IP --> BR
-  Harness --> Loop
-  Loop --> BuiltIn
-  Loop --> Tools
-  Tools --> Exa
-  Tools --> AWS
-  Tools --> Browser
-  Tools --> Code
-  CH --> Mem
-  Mem --> Harness
-  IH --> Parse
-  Parse --> NQ
-  Parse --> Chat
+  H --> Harness
+  RH -->|stream| UI[텍스트 · toolUse · toolResult]
 ```
 
-| 레이어 | 모듈 / API | 설명 |
-|------|------|------|
-| UI | `application/app.py` | Agent 모드 Streamlit UI. 사용자 입력을 `run_harness`로 전달하고 도구 진행을 표시 |
-| 클라이언트 | `application/agentcore_client.run_harness` | `HARNESS_ARN` 해석 후 `invoke_harness` 스트리밍 처리, `NotificationQueue` 연동 |
-| 배포 | `deployment/create_harness.py` | IAM·AgentCore Memory·Harness 생성, READY 폴링 후 `config.json`에 ARN 저장 |
-| Control Plane | `bedrock-agentcore-control` | `CreateHarness` / `GetHarness` / `ListHarnesses` |
-| Data Plane | `bedrock-agentcore` `InvokeHarness` | 격리 microVM에서 에이전트 실행, 세션·actorId·메시지 전달 |
-| Harness 런타임 | AgentCore Harness | Strands 기반 추론 루프, Memory, 내장 `shell`·`file_operations` |
-| Harness 도구 | `create_harness.py` `tools` | Exa MCP, AWS Knowledge MCP, Browser, Code Interpreter (Skills 배열은 미설정) |
-| 참고 | `application/chat.py` | Bedrock 모델 메타데이터용. UI Agent 경로에서는 사용하지 않음 |
+### Harness 구성 (`create_harness.py`)
+
+| 항목 | 이 저장소 설정 |
+|------|----------------|
+| **모델** | `global.anthropic.claude-opus-4-7` (Bedrock Inference Profile) |
+| **systemPrompt** | 한국어 대화형 AI 역할 + 에이전트 워크플로 안내 |
+| **Memory** | AgentCore Memory — `customMemoryStrategy`로 사용자 선호 추출 (`actorId` 스코프) |
+| **대화 윈도우** | `sliding_window`, 최근 50 메시지 |
+| **한도** | `maxIterations=20`, `maxTokens=50000`, `timeoutSeconds=300` |
+| **런타임 환경** | `PUBLIC` 네트워크 · idle 600s · maxLifetime 14400s |
+| **내장 도구** | `shell`, `file_operations` (Harness 기본 제공) |
+| **연결 도구** | `exa`, `aws_knowledge` (remote MCP), `browser`, `code` |
+| **Skills** | `skills` 배열 미설정 (API로 추가 가능) |
+
+`CreateHarness` 완료 후 `HARNESS_ARN`이 `deployment/config.json`에 저장됩니다. UI의 `run_harness`는 이 ARN(또는 `projectName`/`harnessName` 조회)으로 Harness를 찾아 `messages`를 보내고, Harness가 도구를 호출하며 스트림 이벤트(`text`, `toolUse`, `toolResult`)를 반환합니다.
+
+| 단계 | 경로 |
+|------|------|
+| 프로비저닝 | IAM 역할 · Memory · `CreateHarness` → `config.json` |
+| 호출 | `app.py` → `run_harness` → `invoke_harness` |
+| 실행 | Harness microVM — 추론 ↔ 도구 반복 후 최종 응답 스트리밍 |
 
 
 ## 주요 기능
