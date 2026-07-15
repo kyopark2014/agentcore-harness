@@ -200,6 +200,22 @@ def normalize_bedrock_message_content(content):
     return str(content)
 
 
+
+def _build_tool_reference(ref_item: dict) -> dict:
+    """Build a display reference from a RAG doc item."""
+    reference = ref_item.get("reference") or {}
+    contents = ref_item.get("contents") or ""
+    content_text = contents[:100] + "..." if len(contents) > 100 else contents
+    result = {
+        "url": reference.get("url"),
+        "title": reference.get("title"),
+        "content": content_text,
+    }
+    if reference.get("page") is not None:
+        result["page"] = reference["page"]
+    return result
+
+
 def get_tool_info(tool_name, tool_content):
     tool_references = []    
     urls = []
@@ -521,27 +537,13 @@ def get_tool_info(tool_name, tool_content):
                 for item in json_data:
                     logger.info(f"item: {item}")
                     if "reference" in item and "contents" in item:
-                        url = item["reference"]["url"]
-                        title = item["reference"]["title"]
-                        content_text = item["contents"][:100] + "..." if len(item["contents"]) > 100 else item["contents"]
-                        tool_references.append({
-                            "url": url,
-                            "title": title,
-                            "content": content_text
-                        })
+                        tool_references.append(_build_tool_reference(item))
             else:
                 logger.info(f"json_data is not a dict: {json_data}")
 
                 for item in json_data:
                     if "reference" in item and "contents" in item:
-                        url = item["reference"]["url"]
-                        title = item["reference"]["title"]
-                        content_text = item["contents"][:100] + "..." if len(item["contents"]) > 100 else item["contents"]
-                        tool_references.append({
-                            "url": url,
-                            "title": title,
-                            "content": content_text
-                        })
+                        tool_references.append(_build_tool_reference(item))
                 
             logger.info(f"tool_references: {tool_references}")
 
