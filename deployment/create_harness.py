@@ -389,9 +389,8 @@ def ensure_agent_memory_arn(
             logger.warning(f"Could not persist agentcore_memory_role to config.json: {e}")
     logger.info(f"Using agentcore_memory_role: {memory_exec_role}")
 
-    from agentcore_memory import USER_PREFERENCE_PROMPT
+    from agentcore_memory import shared_memory_strategies
 
-    namespace = f"/users/{memory_token}"
     _memory_creation_attempts = 6
     result = None
     for attempt in range(_memory_creation_attempts):
@@ -400,22 +399,7 @@ def ensure_agent_memory_arn(
                 name=memory_token,
                 description=f"Memory for {project_name}",
                 event_expiry_days=365,
-                strategies=[
-                    {
-                        "customMemoryStrategy": {
-                            "name": memory_token,
-                            "namespaces": [namespace],
-                            "configuration": {
-                                "userPreferenceOverride": {
-                                    "extraction": {
-                                        "modelId": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-                                        "appendToPrompt": USER_PREFERENCE_PROMPT,
-                                    }
-                                }
-                            },
-                        }
-                    }
-                ],
+                strategies=shared_memory_strategies(),
                 memory_execution_role_arn=memory_exec_role,
             )
             break
