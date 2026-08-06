@@ -136,7 +136,7 @@ harness_info = create_or_get_harness(
 environment = s3_files_vpc.build_harness_runtime_environment(s3_files_info)
 
 agentcore_control_client.create_harness(
-    harnessName=harness_api_name,
+    harnessName=harness_name_for_api(project_name),  # '-' → '_'
     executionRoleArn=execution_role_arn,
     # … model, tools, memory …
     environment=environment,

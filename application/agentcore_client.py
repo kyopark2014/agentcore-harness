@@ -29,15 +29,16 @@ bedrock_region = config['region']
 accountId = config['accountId']
 projectName = config['projectName']
 
-# Same rule as deployment/create_harness.harness_name_for_api (CreateHarness harnessName).
+# Same rule as installer.harness_name_for_api: harness name only ('-' → '_').
 _HARNESS_NAME_API_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{0,39}$")
 
 
 def harness_name_for_api(project_name: str) -> str | None:
-    normalized = project_name.replace("-", "_")
+    """Map projectName to CreateHarness harnessName ('-' → '_')."""
+    normalized = (project_name or "").replace("-", "_")
     if not _HARNESS_NAME_API_RE.fullmatch(normalized):
         logger.error(
-            f"harness_name_for_api: invalid name after '-→_': {normalized!r}, "
+            f"harness_name_for_api: invalid after '-'→'_': {normalized!r}, "
             f"projectName: {project_name!r}"
         )
         return None
@@ -45,7 +46,7 @@ def harness_name_for_api(project_name: str) -> str | None:
 
 
 def _normalize_harness_api_name(value: str) -> str | None:
-    """CreateHarness harnessName rules (hyphens → underscores)."""
+    """Normalize harnessName lookup key ('-' → '_')."""
     n = (value or "").strip().replace("-", "_")
     if not _HARNESS_NAME_API_RE.fullmatch(n):
         logger.error(

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 AWS Infrastructure Installer using boto3
-This script provisions AgentCore Harness (S3, skills, VPC, S3 Files mount,
-CloudFront, IAM roles, Memory, CreateHarness) for local development.
+This script provisions AgentCore Harness (S3, skills, VPC, CloudFront,
+IAM roles, CreateHarness) for local development.
 """
 
 import boto3
@@ -16,14 +16,12 @@ import mimetypes
 import uuid
 from typing import Dict, List, Optional
 from botocore.exceptions import ClientError
-from bedrock_agentcore.memory import MemoryClient
-
-import s3_files_vpc
 
 # Configuration
-project_name = "agent-harness"  # at least 3 characters
+project_name = "agentcore-harness"  # at least 3 characters
 region = "us-west-2"
 DEFAULT_MODEL_ID = "global.anthropic.claude-opus-4-7"
+VPC_CIDR = "10.52.0.0/16"
 
 # Shared S3 / CloudFront with agent-skills (rag-project) — reuse if already present.
 SHARED_STORAGE_NAME = "rag-project"
@@ -39,7 +37,6 @@ account_id = str(sts_client.get_caller_identity()["Account"])
 iam_client = boto3.client("iam", region_name=region)
 s3_client = boto3.client("s3", region_name=region)
 ec2_client = boto3.client("ec2", region_name=region)
-s3files_client = boto3.client("s3files", region_name=region)
 cloudfront_client = boto3.client("cloudfront", region_name=region)
 agentcore_control_client = boto3.client(
     "bedrock-agentcore-control",
@@ -86,10 +83,10 @@ logger = setup_logging()
 
 def harness_name_for_api(name: str) -> str:
     """
-    Map config projectName to a valid Harness name.
-    Hyphens are invalid in the API; they are replaced with underscores.
+    Map projectName to CreateHarness harnessName.
+    Only for harnessName: replace '-' with '_' (API disallows hyphens).
     """
-    normalized = name.replace("-", "_")
+    normalized = (name or "").replace("-", "_")
     if not _HARNESS_NAME_API_RE.fullmatch(normalized):
         logger.error(
             "CreateHarness harnessName must match [a-zA-Z][a-zA-Z0-9_]{0,39} "
@@ -118,8 +115,11 @@ def create_iam_role(
     assume_role_policy: Dict,
     managed_policies: Optional[List[str]] = None,
     description: Optional[str] = None,
-) -> str:
-    """Create IAM role (or update trust/policies if it already exists)."""
+) -> tuple[str, bool]:
+    """Create IAM role (or update trust/policies if it already exists).
+
+    Returns (role_arn, created) where created is True only for a newly created role.
+    """
     logger.debug(f"Creating IAM role: {role_name}")
 
     try:
@@ -141,7 +141,7 @@ def create_iam_role(
                 logger.debug(f"Attached policy: {policy_arn}")
 
         logger.info(f"✓ IAM role created: {role_name}")
-        return role_arn
+        return role_arn, True
 
     except ClientError as e:
         if e.response["Error"]["Code"] == "EntityAlreadyExists":
@@ -179,7 +179,7 @@ def create_iam_role(
                 except ClientError as policy_error:
                     logger.warning(f"Could not update managed policies: {policy_error}")
 
-            return role_arn
+            return role_arn, False
         logger.error(f"Failed to create IAM role {role_name}: {e}")
         raise
 
@@ -203,8 +203,7 @@ def attach_inline_policy(role_name: str, policy_name: str, policy_document: Dict
 def load_config(config_path: str) -> Dict:
     """Load application config, creating defaults when missing."""
     global project_name, region, account_id
-    global agentcore_control_client, s3_client, cloudfront_client
-    global ec2_client, s3files_client
+    global agentcore_control_client, s3_client, cloudfront_client, ec2_client
 
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -239,22 +238,315 @@ def load_config(config_path: str) -> Dict:
     )
     s3_client = boto3.client("s3", region_name=region)
     ec2_client = boto3.client("ec2", region_name=region)
-    s3files_client = boto3.client("s3files", region_name=region)
     cloudfront_client = boto3.client("cloudfront", region_name=region)
     return config
 
 
-def _s3_files_provisioner() -> s3_files_vpc.S3FilesVpcProvisioner:
-    return s3_files_vpc.S3FilesVpcProvisioner(
-        ec2_client=ec2_client,
-        s3_client=s3_client,
-        s3files_client=s3files_client,
-        iam_client=iam_client,
-        region=region,
-        account_id=account_id,
-        project_name=project_name,
-        logger=logger,
+def _vpc_name() -> str:
+    return f"vpc-for-{project_name}"
+
+
+def _enable_vpc_dns(vpc_id: str) -> None:
+    ec2_client.modify_vpc_attribute(VpcId=vpc_id, EnableDnsSupport={"Value": True})
+    ec2_client.modify_vpc_attribute(VpcId=vpc_id, EnableDnsHostnames={"Value": True})
+
+
+def _subnet_is_public(subnet_id: str) -> bool:
+    rts = ec2_client.describe_route_tables(
+        Filters=[{"Name": "association.subnet-id", "Values": [subnet_id]}]
+    ).get("RouteTables", [])
+    if not rts:
+        subnet = ec2_client.describe_subnets(SubnetIds=[subnet_id])["Subnets"][0]
+        rts = ec2_client.describe_route_tables(
+            Filters=[
+                {"Name": "vpc-id", "Values": [subnet["VpcId"]]},
+                {"Name": "association.main", "Values": ["true"]},
+            ]
+        ).get("RouteTables", [])
+    for rt in rts:
+        for route in rt.get("Routes", []):
+            if str(route.get("GatewayId", "")).startswith("igw-"):
+                return True
+    return False
+
+
+def _classify_subnets(vpc_id: str) -> tuple[List[str], List[str]]:
+    subnets = ec2_client.describe_subnets(
+        Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+    ).get("Subnets", [])
+    public_subnets: List[str] = []
+    private_subnets: List[str] = []
+    for subnet in subnets:
+        if subnet.get("State") != "available":
+            continue
+        name = ""
+        for tag in subnet.get("Tags") or []:
+            if tag["Key"] == "Name":
+                name = tag["Value"]
+                break
+        sid = subnet["SubnetId"]
+        if "private" in name.lower():
+            private_subnets.append(sid)
+        elif "public" in name.lower():
+            public_subnets.append(sid)
+        elif _subnet_is_public(sid):
+            public_subnets.append(sid)
+        else:
+            private_subnets.append(sid)
+    return public_subnets, private_subnets
+
+
+def _create_vpc() -> Dict[str, object]:
+    azs = [
+        z["ZoneName"]
+        for z in ec2_client.describe_availability_zones(
+            Filters=[{"Name": "state", "Values": ["available"]}]
+        )["AvailabilityZones"]
+    ][:2]
+    if len(azs) < 2:
+        raise RuntimeError("Need at least 2 availability zones for Harness VPC")
+
+    vpc_id = ec2_client.create_vpc(
+        CidrBlock=VPC_CIDR,
+        TagSpecifications=[
+            {
+                "ResourceType": "vpc",
+                "Tags": [{"Key": "Name", "Value": _vpc_name()}],
+            }
+        ],
+    )["Vpc"]["VpcId"]
+    ec2_client.get_waiter("vpc_available").wait(VpcIds=[vpc_id])
+    _enable_vpc_dns(vpc_id)
+    logger.info(f"  Created VPC: {vpc_id}")
+
+    igw_id = ec2_client.create_internet_gateway(
+        TagSpecifications=[
+            {
+                "ResourceType": "internet-gateway",
+                "Tags": [{"Key": "Name", "Value": f"igw-for-{project_name}"}],
+            }
+        ]
+    )["InternetGateway"]["InternetGatewayId"]
+    ec2_client.attach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
+
+    public_rt = ec2_client.create_route_table(
+        VpcId=vpc_id,
+        TagSpecifications=[
+            {
+                "ResourceType": "route-table",
+                "Tags": [{"Key": "Name", "Value": f"public-rt-for-{project_name}"}],
+            }
+        ],
+    )["RouteTable"]["RouteTableId"]
+    ec2_client.create_route(
+        RouteTableId=public_rt,
+        DestinationCidrBlock="0.0.0.0/0",
+        GatewayId=igw_id,
     )
+
+    public_subnets: List[str] = []
+    private_subnets: List[str] = []
+    for i, az in enumerate(azs):
+        pub = ec2_client.create_subnet(
+            VpcId=vpc_id,
+            CidrBlock=f"10.52.{i}.0/24",
+            AvailabilityZone=az,
+            TagSpecifications=[
+                {
+                    "ResourceType": "subnet",
+                    "Tags": [
+                        {"Key": "Name", "Value": f"public-{i}-for-{project_name}"}
+                    ],
+                }
+            ],
+        )["Subnet"]["SubnetId"]
+        ec2_client.modify_subnet_attribute(
+            SubnetId=pub, MapPublicIpOnLaunch={"Value": True}
+        )
+        ec2_client.associate_route_table(SubnetId=pub, RouteTableId=public_rt)
+        public_subnets.append(pub)
+
+        priv = ec2_client.create_subnet(
+            VpcId=vpc_id,
+            CidrBlock=f"10.52.{10 + i}.0/24",
+            AvailabilityZone=az,
+            TagSpecifications=[
+                {
+                    "ResourceType": "subnet",
+                    "Tags": [
+                        {"Key": "Name", "Value": f"private-{i}-for-{project_name}"}
+                    ],
+                }
+            ],
+        )["Subnet"]["SubnetId"]
+        private_subnets.append(priv)
+
+    # One NAT for outbound from private subnets (MCP / Bedrock APIs).
+    eip = ec2_client.allocate_address(Domain="vpc")["AllocationId"]
+    nat_id = ec2_client.create_nat_gateway(
+        SubnetId=public_subnets[0],
+        AllocationId=eip,
+        TagSpecifications=[
+            {
+                "ResourceType": "natgateway",
+                "Tags": [{"Key": "Name", "Value": f"nat-for-{project_name}"}],
+            }
+        ],
+    )["NatGateway"]["NatGatewayId"]
+    logger.info(f"  Waiting for NAT Gateway: {nat_id}")
+    ec2_client.get_waiter("nat_gateway_available").wait(NatGatewayIds=[nat_id])
+
+    private_rt = ec2_client.create_route_table(
+        VpcId=vpc_id,
+        TagSpecifications=[
+            {
+                "ResourceType": "route-table",
+                "Tags": [{"Key": "Name", "Value": f"private-rt-for-{project_name}"}],
+            }
+        ],
+    )["RouteTable"]["RouteTableId"]
+    ec2_client.create_route(
+        RouteTableId=private_rt,
+        DestinationCidrBlock="0.0.0.0/0",
+        NatGatewayId=nat_id,
+    )
+    for subnet_id in private_subnets:
+        ec2_client.associate_route_table(SubnetId=subnet_id, RouteTableId=private_rt)
+
+    logger.info(
+        f"✓ VPC ready: {vpc_id} "
+        f"(public={public_subnets}, private={private_subnets})"
+    )
+    return {
+        "vpc_id": vpc_id,
+        "public_subnets": public_subnets,
+        "private_subnets": private_subnets,
+    }
+
+
+def ensure_vpc() -> Dict[str, object]:
+    """Create or reuse a project VPC with public + private subnets and NAT."""
+    logger.info(f"Ensuring VPC for Harness: {_vpc_name()}")
+    resp = ec2_client.describe_vpcs(
+        Filters=[{"Name": "tag:Name", "Values": [_vpc_name()]}]
+    )
+    vpcs = resp.get("Vpcs") or []
+    if vpcs:
+        vpc_id = vpcs[0]["VpcId"]
+        logger.info(f"  Reusing VPC: {vpc_id}")
+        _enable_vpc_dns(vpc_id)
+        public_subnets, private_subnets = _classify_subnets(vpc_id)
+        if len(private_subnets) < 1:
+            raise RuntimeError(
+                f"VPC {vpc_id} has no private subnets; "
+                "create private subnets or delete the VPC and re-run installer."
+            )
+        return {
+            "vpc_id": vpc_id,
+            "public_subnets": public_subnets,
+            "private_subnets": private_subnets,
+        }
+    return _create_vpc()
+
+
+def _create_or_get_security_group(
+    vpc_id: str, group_name: str, description: str
+) -> str:
+    try:
+        return ec2_client.create_security_group(
+            GroupName=group_name,
+            Description=description,
+            VpcId=vpc_id,
+            TagSpecifications=[
+                {
+                    "ResourceType": "security-group",
+                    "Tags": [{"Key": "Name", "Value": group_name}],
+                }
+            ],
+        )["GroupId"]
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "InvalidGroup.Duplicate":
+            raise
+        sgs = ec2_client.describe_security_groups(
+            Filters=[
+                {"Name": "group-name", "Values": [group_name]},
+                {"Name": "vpc-id", "Values": [vpc_id]},
+            ]
+        )
+        return sgs["SecurityGroups"][0]["GroupId"]
+
+
+def prepare_harness_vpc_network(vpc_info: Dict[str, object]) -> Dict[str, object]:
+    """Ensure harness runtime SG in the project VPC."""
+    vpc_id = str(vpc_info["vpc_id"])
+    private_subnets = list(vpc_info.get("private_subnets") or [])
+    if not private_subnets:
+        raise RuntimeError(
+            "At least one private subnet is required for Harness VPC mode"
+        )
+
+    group_name = f"harness-runtime-sg-for-{project_name}"
+    harness_sg_id = _create_or_get_security_group(
+        vpc_id=vpc_id,
+        group_name=group_name,
+        description=f"Security group for AgentCore Harness ({project_name})",
+    )
+    try:
+        ec2_client.authorize_security_group_egress(
+            GroupId=harness_sg_id,
+            IpPermissions=[
+                {
+                    "IpProtocol": "-1",
+                    "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                }
+            ],
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "InvalidPermission.Duplicate":
+            logger.debug(f"  harness SG egress: {e}")
+
+    logger.info("✓ Harness VPC network ready")
+    logger.info(f"  VPC: {vpc_id}")
+    logger.info(f"  Subnets: {', '.join(private_subnets)}")
+    logger.info(f"  Security group: {harness_sg_id}")
+
+    return {
+        "vpc_id": vpc_id,
+        "subnets": private_subnets,
+        "security_groups": [harness_sg_id],
+    }
+
+
+def build_harness_runtime_environment(
+    vpc_runtime: Optional[Dict[str, object]] = None,
+) -> Dict:
+    """Build CreateHarness/UpdateHarness environment (VPC network)."""
+    lifecycle = {
+        "idleRuntimeSessionTimeout": 600,
+        "maxLifetime": 14400,
+    }
+    subnets = list((vpc_runtime or {}).get("subnets") or [])
+    security_groups = list((vpc_runtime or {}).get("security_groups") or [])
+    if not subnets or not security_groups:
+        return {
+            "agentCoreRuntimeEnvironment": {
+                "lifecycleConfiguration": lifecycle,
+                "networkConfiguration": {"networkMode": "PUBLIC"},
+            }
+        }
+
+    return {
+        "agentCoreRuntimeEnvironment": {
+            "lifecycleConfiguration": lifecycle,
+            "networkConfiguration": {
+                "networkMode": "VPC",
+                "networkModeConfig": {
+                    "subnets": subnets,
+                    "securityGroups": security_groups,
+                },
+            },
+        }
+    }
 
 
 def create_s3_bucket() -> str:
@@ -299,12 +591,6 @@ def create_s3_bucket() -> str:
             CORSConfiguration=cors_configuration,
         )
 
-        logger.debug("Configuring versioning (Enabled required for S3 Files)")
-        s3_client.put_bucket_versioning(
-            Bucket=bucket_name,
-            VersioningConfiguration={"Status": "Enabled"},
-        )
-
         logger.debug("Creating docs and artifacts folders")
         for folder in ["docs/", "artifacts/"]:
             try:
@@ -319,14 +605,6 @@ def create_s3_bucket() -> str:
     except ClientError as e:
         if e.response["Error"]["Code"] in ["BucketAlreadyExists", "BucketAlreadyOwnedByYou"]:
             logger.warning(f"S3 bucket already exists (reusing shared): {bucket_name}")
-            # Versioning Enabled is required for S3 Files even on a reused bucket.
-            try:
-                s3_client.put_bucket_versioning(
-                    Bucket=bucket_name,
-                    VersioningConfiguration={"Status": "Enabled"},
-                )
-            except ClientError as ver_error:
-                logger.warning(f"Failed to ensure versioning on existing bucket: {ver_error}")
             logger.debug("Creating docs and artifacts folders in existing bucket")
             for folder in ["docs/", "artifacts/"]:
                 try:
@@ -571,7 +849,7 @@ def create_harness_execution_role() -> str:
         ],
     }
 
-    role_arn = create_iam_role(
+    role_arn, role_created = create_iam_role(
         role_name,
         assume_role_policy,
         description="Execution role for Bedrock AgentCore harness",
@@ -651,211 +929,16 @@ def create_harness_execution_role() -> str:
         f"harness-exec-inline-for-{role_name}",
         harness_execution_policy,
     )
+    # CreateHarness validates AssumeRole immediately after a brand-new role.
+    if role_created:
+        wait_seconds = 20
+        logger.info(
+            f"  Waiting {wait_seconds}s for IAM role/policy propagation "
+            f"before CreateHarness..."
+        )
+        time.sleep(wait_seconds)
     logger.info(f"✓ Harness execution role ready: {role_arn}")
     return role_arn
-
-
-USER_PREFERENCE_PROMPT = (
-    "You are tasked with analyzing conversations to extract the user's preferences. You'll be analyzing two sets of data:\n"
-    "<past_conversation>\n"
-    "[Past conversations between the user and system will be placed here for context]\n"
-    "</past_conversation>\n"
-    "<current_conversation>\n"
-    "[The current conversation between the user and system will be placed here]\n"
-    "</current_conversation>\n"
-    "Your job is to identify and categorize the user's preferences into two main types:\n"
-    "- Explicit preferences: Directly stated preferences by the user.\n"
-    "- Implicit preferences: Inferred from patterns, repeated inquiries, or contextual clues. Take a close look at user's request for implicit preferences.\n"
-    "For explicit preference, extract only preference that the user has explicitly shared. Do not infer user's preference.\n"
-    "For implicit preference, it is allowed to infer user's preference, but only the ones with strong signals, such as requesting something multiple times.\n"
-    "Use Korean.\n"
-)
-
-SUMMARY_PROMPT = (
-    "You will be given a text block and a list of summaries you previously generated when available.\n"
-    "<task>\n"
-    "- When the previously generated is not available, your goal is to summarize the given text block.\n"
-    "- When there is existing summary, your goal is to extend summary by taking into account the given text block.\n"
-    "- If there are queries/topics specified in the text block, your generated summary need to cover those queries/topics.\n"
-    "- If there are instructions in the text block **guiding you how to generate summary**, you MUST follow them.\n"
-    "</task>\n"
-    "Use Korean.\n"
-)
-
-SEMANTIC_PROMPT = (
-    "You are a long-term memory extraction agent supporting a lifelong learning system.\n"
-    "Your task is to identify and extract meaningful information about the users from a given list of messages.\n"
-    "Analyze the conversation and extract structured information about the user according to the schema below.\n"
-    "Only include details that are explicitly stated or can be logically inferred from the conversation.\n"
-    "- Extract information ONLY from the user messages. You should use assistant messages only as supporting context.\n"
-    "- If the conversation contains no relevant or noteworthy information, return an empty list.\n"
-    "- Do NOT extract anything from prior conversation history, even if provided. Use it solely for context.\n"
-    "- Do NOT incorporate external knowledge.\n"
-    "- Avoid duplicate extractions.\n"
-    "Use Korean.\n"
-)
-
-SEMANTIC_CONSOLIDATION_PROMPT = (
-    "You consolidate newly extracted facts with existing long-term semantic memories.\n"
-    "- Merge duplicates; keep the most specific and recent facts.\n"
-    "- Do not invent facts that were not extracted.\n"
-    "- Prefer clear, atomic statements in Korean.\n"
-    "Use Korean.\n"
-)
-
-MEMORY_EXTRACTION_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-
-
-def _shared_memory_strategies() -> list:
-    """UserPreference + Summary + Semantic (one of each kind per memory_id)."""
-    return [
-        {
-            "customMemoryStrategy": {
-                "name": "UserPreference",
-                "namespaces": ["/users/{actorId}/preferences"],
-                "configuration": {
-                    "userPreferenceOverride": {
-                        "extraction": {
-                            "modelId": MEMORY_EXTRACTION_MODEL_ID,
-                            "appendToPrompt": USER_PREFERENCE_PROMPT,
-                        }
-                    }
-                },
-            }
-        },
-        {
-            "customMemoryStrategy": {
-                "name": "Summary",
-                "namespaces": ["/users/{actorId}/sessions/{sessionId}"],
-                "configuration": {
-                    "summaryOverride": {
-                        "consolidation": {
-                            "modelId": MEMORY_EXTRACTION_MODEL_ID,
-                            "appendToPrompt": SUMMARY_PROMPT,
-                        }
-                    }
-                },
-            }
-        },
-        {
-            "customMemoryStrategy": {
-                "name": "Semantic",
-                "namespaces": ["/users/{actorId}/facts"],
-                "configuration": {
-                    "semanticOverride": {
-                        "extraction": {
-                            "modelId": MEMORY_EXTRACTION_MODEL_ID,
-                            "appendToPrompt": SEMANTIC_PROMPT,
-                        },
-                        "consolidation": {
-                            "modelId": MEMORY_EXTRACTION_MODEL_ID,
-                            "appendToPrompt": SEMANTIC_CONSOLIDATION_PROMPT,
-                        },
-                    }
-                },
-            }
-        },
-    ]
-
-
-def create_agentcore_memory_role() -> str:
-    """Create AgentCore Memory IAM role."""
-    logger.info("[4/9] Creating AgentCore Memory IAM role")
-    role_name = f"role-agentcore-memory-for-{project_name}-{region}"
-
-    # Trust must include aws:SourceAccount / aws:SourceArn; CreateMemory rejects otherwise.
-    # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/long-term-configuring-custom-strategies.html
-    assume_role_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Sid": "MemoryAssumeRolePolicy",
-                "Effect": "Allow",
-                "Principal": {
-                    "Service": "bedrock-agentcore.amazonaws.com"
-                },
-                "Action": "sts:AssumeRole",
-                "Condition": {
-                    "StringEquals": {
-                        "aws:SourceAccount": account_id
-                    },
-                    "ArnLike": {
-                        "aws:SourceArn": (
-                            f"arn:aws:bedrock-agentcore:{region}:{account_id}:*"
-                        )
-                    },
-                },
-            }
-        ],
-    }
-
-    role_arn = create_iam_role(role_name, assume_role_policy)
-
-    memory_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": [
-                    "bedrock:InvokeModel",
-                    "bedrock:InvokeModelWithResponseStream",
-                ],
-                "Resource": [
-                    "arn:aws:bedrock:*::foundation-model/*",
-                    "arn:aws:bedrock:*:*:inference-profile/*",
-                ],
-                "Condition": {
-                    "StringEquals": {
-                        "aws:ResourceAccount": account_id
-                    }
-                },
-            }
-        ],
-    }
-    attach_inline_policy(role_name, f"agentcore-memory-policy-for-{project_name}", memory_policy)
-
-    # IAM eventual consistency: CreateMemory validates trust immediately after role create/update
-    logger.info("  Waiting for IAM role trust policy to propagate...")
-    time.sleep(10)
-
-    return role_arn
-
-
-def create_agentcore_memory(role_arn: str, user_id: str = "installer") -> str:
-    """
-    Create AgentCore Memory with shared UserPreference / Summary / Semantic strategies.
-
-    user_id is unused for strategy naming — kept for call-site compatibility.
-    User isolation uses {actorId}/{sessionId} namespace templates from CreateEvent.
-    """
-    logger.info("[5/9] Creating AgentCore Memory")
-
-    memory_client = MemoryClient(region_name=region)
-    memory_name = project_name.replace("-", "_")
-
-    memories = memory_client.list_memories()
-    for memory in memories:
-        if memory.get("id", "").split("-")[0] == memory_name:
-            memory_id = memory.get("id")
-            logger.info(f"  Memory already exists: {memory_id}")
-            return memory_id
-
-    strategies = _shared_memory_strategies()
-    result = memory_client.create_memory_and_wait(
-        name=memory_name,
-        description=f"Memory for {project_name}",
-        event_expiry_days=365,
-        strategies=strategies,
-        memory_execution_role_arn=role_arn,
-    )
-    memory_id = result.get("id")
-    names = [s["customMemoryStrategy"]["name"] for s in strategies]
-    logger.info(f"  ✓ Memory created: {memory_id} (strategies={names})")
-    return memory_id
-
-
-def _memory_arn_from_id(memory_id: str) -> str:
-    return f"arn:aws:bedrock-agentcore:{region}:{account_id}:memory/{memory_id}"
 
 
 BASE_SYSTEM_PROMPT = (
@@ -896,34 +979,6 @@ def find_harness_by_api_name(harness_api_name: str) -> Optional[Dict]:
     return None
 
 
-def ensure_harness_memory_binding(harness_id: str, agent_memory_arn: str) -> None:
-    """Align harness memory binding with the ensured AgentCore Memory ARN."""
-    h = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
-    memory_cfg = (
-        ((h.get("memory") or {}).get("agentCoreMemoryConfiguration") or {})
-        if isinstance(h.get("memory"), dict)
-        else {}
-    )
-    current = memory_cfg.get("arn")
-    if current == agent_memory_arn:
-        return
-
-    logger.info(
-        f"Updating harness memory: {current!r} -> {agent_memory_arn!r} "
-        f"(harnessId={harness_id})"
-    )
-    agentcore_control_client.update_harness(
-        harnessId=harness_id,
-        memory={
-            "optionalValue": {
-                "agentCoreMemoryConfiguration": {
-                    "arn": agent_memory_arn,
-                },
-            },
-        },
-    )
-
-
 def wait_for_harness_ready(harness_id: str, timeout_seconds: int = 300) -> str:
     """Poll until harness reaches READY; return harness ARN."""
     deadline = time.time() + timeout_seconds
@@ -957,67 +1012,56 @@ def ensure_harness_environment(
     harness_id: str,
     environment: Dict,
 ) -> None:
-    """Update harness environment when VPC / S3 Files mount differs from desired."""
+    """Update harness environment when VPC network config differs from desired."""
     h = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
     current_env = h.get("environment") or {}
     desired = environment or {}
-    current_rt = (current_env.get("agentCoreRuntimeEnvironment") or {})
-    desired_rt = (desired.get("agentCoreRuntimeEnvironment") or {})
+    current_rt = current_env.get("agentCoreRuntimeEnvironment") or {}
+    desired_rt = desired.get("agentCoreRuntimeEnvironment") or {}
 
-    current_mode = (current_rt.get("networkConfiguration") or {}).get("networkMode")
-    desired_mode = (desired_rt.get("networkConfiguration") or {}).get("networkMode")
-    current_fs = current_rt.get("filesystemConfigurations") or []
-    desired_fs = desired_rt.get("filesystemConfigurations") or []
+    current_net = current_rt.get("networkConfiguration") or {}
+    desired_net = desired_rt.get("networkConfiguration") or {}
+    current_mode = current_net.get("networkMode")
+    desired_mode = desired_net.get("networkMode")
+    current_cfg = current_net.get("networkModeConfig") or {}
+    desired_cfg = desired_net.get("networkModeConfig") or {}
 
-    current_ap = ""
-    for cfg in current_fs:
-        ap = (cfg.get("s3FilesAccessPoint") or {}).get("accessPointArn") or ""
-        if ap:
-            current_ap = ap
-            break
-    desired_ap = ""
-    for cfg in desired_fs:
-        ap = (cfg.get("s3FilesAccessPoint") or {}).get("accessPointArn") or ""
-        if ap:
-            desired_ap = ap
-            break
-
-    if current_mode == desired_mode and current_ap == desired_ap:
+    same_vpc = (
+        current_mode == desired_mode
+        and sorted(current_cfg.get("subnets") or [])
+        == sorted(desired_cfg.get("subnets") or [])
+        and sorted(current_cfg.get("securityGroups") or [])
+        == sorted(desired_cfg.get("securityGroups") or [])
+    )
+    if same_vpc:
         logger.info(
-            f"  Harness environment already matches "
-            f"(networkMode={desired_mode}, s3FilesAccessPoint={'set' if desired_ap else 'none'})"
+            f"  Harness environment already matches (networkMode={desired_mode})"
         )
         return
 
     logger.info(
-        f"  Updating harness environment: networkMode {current_mode!r} -> {desired_mode!r}, "
-        f"s3FilesAccessPoint {'set' if desired_ap else 'none'}"
+        f"  Updating harness environment: networkMode {current_mode!r} -> {desired_mode!r}"
     )
     agentcore_control_client.update_harness(
         harnessId=harness_id,
         environment=desired,
-        environmentVariables={
-            "LOG_LEVEL": "info",
-            "SESSION_STORAGE_DIR": s3_files_vpc.SESSION_STORAGE_MOUNT_PATH,
-        },
+        environmentVariables={"LOG_LEVEL": "info"},
     )
 
 
 def create_or_get_harness(
     execution_role_arn: str,
-    agent_memory_arn: str,
-    s3_files_info: Optional[Dict[str, object]] = None,
+    vpc_runtime: Optional[Dict[str, object]] = None,
 ) -> Dict[str, str]:
     """Create AgentCore Harness or reuse an existing one by API name."""
-    logger.info("[8/9] Creating AgentCore Harness")
+    logger.info("[5/6] Creating AgentCore Harness")
 
     harness_api_name = harness_name_for_api(project_name)
-    if harness_api_name != project_name:
-        logger.info(f"  harnessName (API): {harness_api_name} (from projectName)")
+    logger.info(f"  harnessName: {harness_api_name} (from projectName={project_name!r})")
 
     model_id = DEFAULT_MODEL_ID
     system_prompt = [{"text": BASE_SYSTEM_PROMPT}]
-    environment = s3_files_vpc.build_harness_runtime_environment(s3_files_info)
+    environment = build_harness_runtime_environment(vpc_runtime)
 
     existing = find_harness_by_api_name(harness_api_name)
     if existing:
@@ -1052,7 +1096,6 @@ def create_or_get_harness(
             except ClientError as e:
                 if e.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
                     raise
-            # Wait until gone
             deadline = time.time() + 600
             while time.time() < deadline:
                 try:
@@ -1109,11 +1152,6 @@ def create_or_get_harness(
                         "config": {"agentCoreCodeInterpreter": {}},
                     },
                 ],
-                memory={
-                    "agentCoreMemoryConfiguration": {
-                        "arn": agent_memory_arn,
-                    }
-                },
                 truncation={
                     "strategy": "sliding_window",
                     "config": {"slidingWindow": {"messagesCount": 50}},
@@ -1122,10 +1160,7 @@ def create_or_get_harness(
                 maxTokens=50000,
                 timeoutSeconds=300,
                 environment=environment,
-                environmentVariables={
-                    "LOG_LEVEL": "info",
-                    "SESSION_STORAGE_DIR": s3_files_vpc.SESSION_STORAGE_MOUNT_PATH,
-                },
+                environmentVariables={"LOG_LEVEL": "info"},
                 tags={"Project": project_name, "Env": "dev"},
             )
             harness_id = response["harness"]["harnessId"]
@@ -1146,7 +1181,6 @@ def create_or_get_harness(
                 f"({harness_api_name!r})."
             )
 
-    ensure_harness_memory_binding(harness_id, agent_memory_arn)
     ensure_harness_environment(harness_id, environment)
     harness_arn = wait_for_harness_ready(harness_id)
 
@@ -1169,7 +1203,10 @@ def write_config(config_path: str, config_data: Dict, *, merge_existing: bool = 
         except Exception as e:
             logger.warning(f"Could not read existing {config_path}: {e}")
 
-    existing.update(config_data)
+    existing.update({k: v for k, v in config_data.items() if v is not None})
+    for k, v in config_data.items():
+        if v is None:
+            existing.pop(k, None)
     try:
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         with open(config_path, "w", encoding="utf-8") as f:
@@ -1182,14 +1219,11 @@ def write_config(config_path: str, config_data: Dict, *, merge_existing: bool = 
 
 def build_config_from_deployment_state(
     execution_role_arn: Optional[str] = None,
-    agentcore_memory_role_arn: Optional[str] = None,
-    memory_id: Optional[str] = None,
-    agent_memory_arn: Optional[str] = None,
     harness_info: Optional[Dict[str, str]] = None,
     s3_bucket_name: Optional[str] = None,
     cloudfront_info: Optional[Dict[str, str]] = None,
-    s3_files_info: Optional[Dict[str, object]] = None,
     vpc_info: Optional[Dict[str, object]] = None,
+    vpc_runtime: Optional[Dict[str, object]] = None,
 ) -> Dict:
     config_data: Dict = {
         "projectName": project_name,
@@ -1198,12 +1232,6 @@ def build_config_from_deployment_state(
     }
     if execution_role_arn:
         config_data["executionRoleArn"] = execution_role_arn
-    if agentcore_memory_role_arn:
-        config_data["agentcore_memory_role"] = agentcore_memory_role_arn
-    if memory_id:
-        config_data["memory_id"] = memory_id
-    if agent_memory_arn:
-        config_data["agent_memory_arn"] = agent_memory_arn
     if harness_info:
         if harness_info.get("harness_id"):
             config_data["harnessId"] = harness_info["harness_id"]
@@ -1216,18 +1244,22 @@ def build_config_from_deployment_state(
         config_data["sharing_url"] = f"https://{cloudfront_info.get('domain', '')}"
     if vpc_info:
         config_data["vpc_id"] = vpc_info.get("vpc_id", "")
-    if s3_files_info:
-        config_data["s3_files_file_system_id"] = s3_files_info.get("file_system_id", "")
-        config_data["s3_files_access_point_arn"] = s3_files_info.get(
-            "access_point_arn", ""
-        )
-        config_data["s3_files_mount_path"] = s3_files_info.get(
-            "mount_path", s3_files_vpc.SESSION_STORAGE_MOUNT_PATH
-        )
-        config_data["agent_runtime_vpc_subnets"] = s3_files_info.get("subnets", [])
-        config_data["agent_runtime_security_groups"] = s3_files_info.get(
+    if vpc_runtime:
+        config_data["agent_runtime_vpc_subnets"] = vpc_runtime.get("subnets", [])
+        config_data["agent_runtime_security_groups"] = vpc_runtime.get(
             "security_groups", []
         )
+    # Remove legacy Memory / S3 Files keys on write
+    for legacy in (
+        "agentcore_memory_role",
+        "agent_memory_arn",
+        "memory_id",
+        "memoryId",
+        "s3_files_file_system_id",
+        "s3_files_access_point_arn",
+        "s3_files_mount_path",
+    ):
+        config_data[legacy] = None
     return config_data
 
 
@@ -1250,11 +1282,8 @@ def main():
     start_time = time.time()
     s3_bucket_name = None
     execution_role_arn = None
-    agentcore_memory_role_arn = None
-    memory_id = None
-    agent_memory_arn = None
     vpc_info = None
-    s3_files_info = None
+    vpc_runtime = None
     harness_info = None
     cloudfront_info = None
     deployment_success = False
@@ -1263,26 +1292,15 @@ def main():
         s3_bucket_name = create_s3_bucket()
         upload_skills_to_s3(s3_bucket_name)
         execution_role_arn = create_harness_execution_role()
-        execution_role_name = f"role-harness-for-{project_name}-{region}"
-        agentcore_memory_role_arn = create_agentcore_memory_role()
-        memory_id = create_agentcore_memory(agentcore_memory_role_arn)
-        agent_memory_arn = _memory_arn_from_id(memory_id)
 
-        provisioner = _s3_files_provisioner()
-        logger.info("[6/9] Ensuring VPC for Harness (S3 Files requires VPC mode)")
-        vpc_info = provisioner.ensure_vpc()
-        logger.info("[7/9] Creating S3 Files session storage")
-        s3_files_info = provisioner.create_s3_files_session_storage(
-            vpc_info,
-            s3_bucket_name,
-            execution_role_arn,
-            execution_role_name,
-        )
+        logger.info("[4/6] Ensuring VPC for Harness")
+        vpc_info = ensure_vpc()
+        logger.info("[5/6] Preparing Harness VPC network (security group)")
+        vpc_runtime = prepare_harness_vpc_network(vpc_info)
 
         harness_info = create_or_get_harness(
             execution_role_arn,
-            agent_memory_arn,
-            s3_files_info=s3_files_info,
+            vpc_runtime=vpc_runtime,
         )
         cloudfront_info = create_cloudfront_distribution(s3_bucket_name)
         deployment_success = True
@@ -1295,15 +1313,9 @@ def main():
         logger.info(f"  S3 Bucket: {s3_bucket_name}")
         logger.info(f"  CloudFront Domain: https://{cloudfront_info['domain']}")
         logger.info(f"  VPC: {vpc_info.get('vpc_id')}")
-        logger.info(f"  S3 Files Access Point: {s3_files_info.get('access_point_arn')}")
-        logger.info(
-            f"  S3 Files Mount: {s3_files_info.get('mount_path')} "
-            f"(networkMode=VPC)"
-        )
+        logger.info(f"  Subnets: {vpc_runtime.get('subnets')}")
+        logger.info(f"  Security groups: {vpc_runtime.get('security_groups')}")
         logger.info(f"  Execution Role: {execution_role_arn}")
-        logger.info(f"  AgentCore Memory Role: {agentcore_memory_role_arn}")
-        logger.info(f"  Memory ID: {memory_id}")
-        logger.info(f"  Memory ARN: {agent_memory_arn}")
         logger.info(f"  Harness ID: {harness_info['harness_id']}")
         logger.info(f"  Harness ARN: {harness_info['harness_arn']}")
         logger.info(f"Total deployment time: {elapsed_time / 60:.2f} minutes")
@@ -1318,14 +1330,11 @@ def main():
     finally:
         config_data = build_config_from_deployment_state(
             execution_role_arn=execution_role_arn,
-            agentcore_memory_role_arn=agentcore_memory_role_arn,
-            memory_id=memory_id,
-            agent_memory_arn=agent_memory_arn,
             harness_info=harness_info,
             s3_bucket_name=s3_bucket_name,
             cloudfront_info=cloudfront_info,
-            s3_files_info=s3_files_info,
             vpc_info=vpc_info,
+            vpc_runtime=vpc_runtime,
         )
         if write_config(CONFIG_PATH, config_data):
             if deployment_success:

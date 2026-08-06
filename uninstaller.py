@@ -3,7 +3,7 @@
 AWS Infrastructure Uninstaller for agentcore-harness.
 
 Deletes resources created by installer.py:
-  Harness, Memory, S3 Files, VPC/NAT, CloudFront, S3, IAM roles.
+  Harness, VPC/NAT, CloudFront, S3, IAM roles.
 """
 
 from __future__ import annotations
@@ -20,8 +20,8 @@ from typing import Dict, List, Optional
 import boto3
 from botocore.exceptions import ClientError
 
-# Configuration (must match installer.py / s3_files_vpc.py)
-project_name = "agent-harness"
+# Configuration (must match installer.py)
+project_name = "agentcore-harness"
 region = "us-west-2"
 
 # Shared S3 / CloudFront with agent-skills (rag-project) — retain by default.
@@ -41,7 +41,6 @@ account_id = str(sts_client.get_caller_identity()["Account"])
 s3_client = boto3.client("s3", region_name=region)
 iam_client = boto3.client("iam", region_name=region)
 ec2_client = boto3.client("ec2", region_name=region)
-s3files_client = boto3.client("s3files", region_name=region)
 cloudfront_client = boto3.client("cloudfront", region_name=region)
 agentcore_control_client = boto3.client(
     "bedrock-agentcore-control",
@@ -79,7 +78,7 @@ def _vpc_name() -> str:
 
 def load_config() -> Dict:
     global project_name, region, account_id
-    global s3_client, iam_client, ec2_client, s3files_client
+    global s3_client, iam_client, ec2_client
     global cloudfront_client, agentcore_control_client
 
     try:
@@ -100,7 +99,6 @@ def load_config() -> Dict:
     s3_client = boto3.client("s3", region_name=region)
     iam_client = boto3.client("iam", region_name=region)
     ec2_client = boto3.client("ec2", region_name=region)
-    s3files_client = boto3.client("s3files", region_name=region)
     cloudfront_client = boto3.client("cloudfront", region_name=region)
     agentcore_control_client = boto3.client(
         "bedrock-agentcore-control",
@@ -240,29 +238,25 @@ def _paginate_list_harnesses() -> list:
     return items
 
 
+def harness_name_for_api(name: str) -> str:
+    """Same as installer: projectName → harnessName ('-' → '_')."""
+    return (name or "").replace("-", "_")
+
+
 def resolve_harness_id(cfg: dict) -> Optional[str]:
     if cfg.get("harnessId"):
         return cfg["harnessId"]
     arn = cfg.get("HARNESS_ARN") or ""
     if "harness/" in arn:
         return arn.split("harness/", 1)[-1].strip()
-    names = {project_name.replace("-", "_"), project_name}
+
+    # Fallback: match CreateHarness harnessName (installer harness_name_for_api)
+    api_name = harness_name_for_api(cfg.get("projectName") or project_name)
     for h in _paginate_list_harnesses():
-        if h.get("harnessName") in names:
+        if h.get("harnessName") == api_name:
             return h.get("harnessId")
     return None
 
-
-def resolve_memory_id(cfg: dict) -> Optional[str]:
-    if cfg.get("memory_id"):
-        return cfg["memory_id"]
-    if cfg.get("memoryId"):
-        return cfg["memoryId"]
-    arn = cfg.get("agent_memory_arn") or ""
-    for marker in ("memory/", ":memory/", "/memory/"):
-        if marker in arn:
-            return arn.split(marker, 1)[-1].strip()
-    return None
 
 
 def delete_harness(harness_id: str) -> bool:
@@ -301,172 +295,11 @@ def delete_harness(harness_id: str) -> bool:
     return False
 
 
-def delete_memory(memory_id: str) -> bool:
-    logger.info(f"[5/8] Deleting AgentCore Memory: {memory_id}")
-    try:
-        agentcore_control_client.delete_memory(
-            memoryId=memory_id,
-            clientToken=str(uuid.uuid4()),
-        )
-        logger.info(f"  DeleteMemory accepted: {memory_id}")
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "ResourceNotFoundException":
-            logger.info(f"  Memory already gone: {memory_id}")
-            return True
-        logger.error(f"  DeleteMemory failed: {e}")
-        return False
-
-    deadline = time.monotonic() + DELETE_WAIT_TIMEOUT_SEC
-    while time.monotonic() < deadline:
-        try:
-            m = agentcore_control_client.get_memory(memoryId=memory_id)["memory"]
-            status = m.get("status")
-            if status == "DELETE_FAILED":
-                logger.error(
-                    f"  Memory DELETE_FAILED: {m.get('failureReason')!r}"
-                )
-                return False
-            logger.info(f"  Waiting… status={status!r}")
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "ResourceNotFoundException":
-                logger.info(f"✓ Memory deleted: {memory_id}")
-                return True
-            raise
-        time.sleep(DELETE_POLL_INTERVAL_SEC)
-    logger.error("  Timed out waiting for memory deletion")
-    return False
 
 
-# --- S3 Files ----------------------------------------------------------------
-
-def _is_s3files_not_found(error: ClientError) -> bool:
-    code = error.response["Error"]["Code"]
-    return code in {
-        "ResourceNotFoundException",
-        "FileSystemNotFound",
-        "AccessPointNotFound",
-        "MountTargetNotFound",
-        "NotFound",
-        "404",
-    }
 
 
-def _wait_s3files_gone(describe_fn, id_key: str, resource_id: str, timeout: int = 600):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            resp = describe_fn(**{id_key: resource_id})
-            status = (resp.get("status") or "").lower()
-            if status in {"deleted", "deleting"}:
-                time.sleep(5)
-                continue
-            time.sleep(8)
-        except ClientError as e:
-            if _is_s3files_not_found(e):
-                return
-            raise
-    raise TimeoutError(f"Timed out waiting for S3 Files {resource_id} deletion")
 
-
-def _find_s3files_fs_id(cfg: dict) -> str:
-    if cfg.get("s3_files_file_system_id"):
-        return cfg["s3_files_file_system_id"]
-    bucket_arn = f"arn:aws:s3:::{_bucket_name()}"
-    try:
-        paginator = s3files_client.get_paginator("list_file_systems")
-        for page in paginator.paginate():
-            for item in page.get("fileSystems", []):
-                if item.get("bucket") == bucket_arn:
-                    return item.get("fileSystemId") or ""
-    except ClientError as e:
-        logger.warning(f"  Could not list S3 Files file systems: {e}")
-    return ""
-
-
-def delete_s3files_sync_role():
-    role_name = f"role-s3files-sync-for-{project_name}"
-    if len(role_name) > 64:
-        role_name = role_name[:64]
-    try:
-        for pname in iam_client.list_role_policies(RoleName=role_name).get(
-            "PolicyNames", []
-        ):
-            iam_client.delete_role_policy(RoleName=role_name, PolicyName=pname)
-        iam_client.delete_role(RoleName=role_name)
-        logger.info(f"  ✓ Deleted S3 Files sync role: {role_name}")
-    except ClientError as e:
-        if e.response["Error"]["Code"] != "NoSuchEntity":
-            logger.warning(f"  Could not delete sync role {role_name}: {e}")
-
-
-def delete_s3_files_session_storage(cfg: dict):
-    logger.info("[3/8] Deleting S3 Files session storage")
-    fs_id = _find_s3files_fs_id(cfg)
-    if not fs_id:
-        logger.info("  No S3 Files file system found")
-        delete_s3files_sync_role()
-        return
-
-    logger.info(f"  File system: {fs_id}")
-
-    try:
-        s3files_client.delete_file_system_policy(fileSystemId=fs_id)
-        logger.info("  ✓ Deleted file system policy")
-    except ClientError as e:
-        if not _is_s3files_not_found(e):
-            logger.warning(f"  Could not delete FS policy: {e}")
-
-    access_point_ids: List[str] = []
-    try:
-        paginator = s3files_client.get_paginator("list_access_points")
-        for page in paginator.paginate(fileSystemId=fs_id):
-            for item in page.get("accessPoints", []):
-                if item.get("accessPointId"):
-                    access_point_ids.append(item["accessPointId"])
-    except ClientError as e:
-        logger.warning(f"  Could not list access points: {e}")
-
-    for ap_id in access_point_ids:
-        try:
-            s3files_client.delete_access_point(accessPointId=ap_id)
-            _wait_s3files_gone(s3files_client.get_access_point, "accessPointId", ap_id)
-            logger.info(f"  ✓ Deleted access point: {ap_id}")
-        except ClientError as e:
-            if not _is_s3files_not_found(e):
-                logger.warning(f"  Could not delete access point {ap_id}: {e}")
-
-    mount_ids: List[str] = []
-    try:
-        paginator = s3files_client.get_paginator("list_mount_targets")
-        for page in paginator.paginate(fileSystemId=fs_id):
-            for item in page.get("mountTargets", []):
-                if item.get("mountTargetId"):
-                    mount_ids.append(item["mountTargetId"])
-    except ClientError as e:
-        logger.warning(f"  Could not list mount targets: {e}")
-
-    for mt_id in mount_ids:
-        try:
-            s3files_client.delete_mount_target(mountTargetId=mt_id)
-            _wait_s3files_gone(s3files_client.get_mount_target, "mountTargetId", mt_id)
-            logger.info(f"  ✓ Deleted mount target: {mt_id}")
-        except ClientError as e:
-            if not _is_s3files_not_found(e):
-                logger.warning(f"  Could not delete mount target {mt_id}: {e}")
-
-    try:
-        s3files_client.delete_file_system(fileSystemId=fs_id, forceDelete=True)
-        _wait_s3files_gone(s3files_client.get_file_system, "fileSystemId", fs_id)
-        logger.info(f"  ✓ Deleted file system: {fs_id}")
-    except ClientError as e:
-        if not _is_s3files_not_found(e):
-            logger.warning(f"  Could not delete file system {fs_id}: {e}")
-
-    delete_s3files_sync_role()
-    logger.info("✓ S3 Files session storage deleted")
-
-
-# --- VPC ---------------------------------------------------------------------
 
 def _resolve_vpc_id(cfg: dict) -> Optional[str]:
     if cfg.get("vpc_id"):
@@ -729,10 +562,10 @@ def delete_iam_role(role_name: str):
 def delete_iam_roles():
     logger.info("  Deleting IAM roles")
     harness_role = f"role-harness-for-{project_name}-{region}"
-    memory_role = f"role-agentcore-memory-for-{project_name}-{region}"
     delete_iam_role(harness_role)
-    delete_iam_role(memory_role)
-    delete_s3files_sync_role()
+    # Best-effort cleanup of legacy roles from older installer versions
+    delete_iam_role(f"role-agentcore-memory-for-{project_name}-{region}")
+    delete_iam_role(f"role-s3files-sync-for-{project_name}")
     logger.info("✓ IAM roles processed")
 
 
@@ -849,14 +682,7 @@ def main():
         else:
             logger.info("[2/8] No harness id found; skipping DeleteHarness")
 
-        delete_s3_files_session_storage(cfg)
         delete_vpc(cfg)
-
-        memory_id = resolve_memory_id(cfg)
-        if memory_id:
-            delete_memory(memory_id)
-        else:
-            logger.info("[5/8] No memory id found; skipping DeleteMemory")
 
         delete_iam_roles()
 
