@@ -122,9 +122,9 @@ with st.sidebar:
     modelName = st.selectbox(
         "🖊️ 사용 모델을 선택하세요",
         (
+            "Claude 4.6 Sonnet",
             "Claude 5.0 Sonnet",
             "Claude 5.0 Opus",
-            "Claude 4.6 Sonnet",
             "Claude Fable 5",
             "Claude 4.7 Opus",
             "Claude 4.6 Opus",

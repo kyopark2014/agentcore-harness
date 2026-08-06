@@ -86,7 +86,7 @@ S3 Files 마운트는 **VPC 네트워크 모드**가 필요합니다. `s3_files_
 ```python
 # installer.py main (요약)
 s3_bucket_name = create_s3_bucket()          # versioning=Enabled (S3 Files 요구)
-upload_skills_to_s3(s3_bucket_name)         # skills/ → s3://{bucket}/skills/
+upload_skills_to_s3(s3_bucket_name)         # sync skills/ → s3://{bucket}/skills/
 execution_role_arn = create_harness_execution_role()
 # … Memory …
 
@@ -242,7 +242,9 @@ def build_harness_skills(skill_list: list[str]) -> list[dict]:
 ]
 ```
 
-### S3 업로드 (`installer.upload_skills_to_s3`)
+### S3 동기화 (`installer.upload_skills_to_s3`)
+
+로컬 `skills/`를 `s3://{bucket}/skills/`에 **sync**합니다. 로컬 파일을 업로드·덮어쓰고, S3에만 있는 객체는 삭제합니다 (`aws s3 sync --delete`와 동일).
 
 ```text
 skills/korea-weather/SKILL.md
@@ -262,7 +264,7 @@ Harness 런타임에서 S3 스킬은 보통 다음 경로에 마운트됩니다.
 ### 커스텀 스킬 추가 절차
 
 1. `skills/<name>/SKILL.md` (+ `scripts/` 등) 작성  
-2. (선택) installer 재실행 또는 `aws s3 sync skills/<name> s3://{bucket}/skills/<name>/`  
+2. installer 재실행(전체 sync) 또는 `aws s3 sync skills/<name> s3://{bucket}/skills/<name>/`  
 3. Streamlit 사이드바 Skill 체크 → 다음 `InvokeHarness`에 `skills`로 전달  
 
 ---

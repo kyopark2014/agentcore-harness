@@ -631,32 +631,38 @@ def _should_skip_skill_path(rel_path: str) -> bool:
     return False
 
 
+def _list_s3_keys(bucket: str, prefix: str) -> List[str]:
+    """List all object keys under prefix (paginated)."""
+    keys: List[str] = []
+    token = None
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = s3_client.list_objects_v2(**kwargs)
+        for obj in resp.get("Contents") or []:
+            key = obj.get("Key")
+            if key:
+                keys.append(key)
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+    return keys
+
+
 def upload_skills_to_s3(s3_bucket_name: str) -> int:
-    """Upload skills/ to s3://{bucket}/skills/ (AgentCore S3 skill layout)."""
-    logger.info(f"[2/9] Uploading skills to s3://{s3_bucket_name}/{SKILLS_S3_PREFIX}/")
+    """Sync skills/ to s3://{bucket}/skills/ (upload + prune extras)."""
+    logger.info(f"[2/9] Syncing skills to s3://{s3_bucket_name}/{SKILLS_S3_PREFIX}/")
 
     if not os.path.isdir(SKILLS_DIR):
-        logger.warning(f"Skills directory not found: {SKILLS_DIR}; skipping upload")
+        logger.warning(f"Skills directory not found: {SKILLS_DIR}; skipping sync")
         return 0
 
     prefix = f"{SKILLS_S3_PREFIX}/"
-    try:
-        existing = s3_client.list_objects_v2(
-            Bucket=s3_bucket_name,
-            Prefix=prefix,
-            MaxKeys=1,
-        )
-        if existing.get("KeyCount", 0) > 0 or existing.get("Contents"):
-            logger.warning(
-                f"Skills already exist at s3://{s3_bucket_name}/{prefix}; skipping upload"
-            )
-            return 0
-    except ClientError as e:
-        logger.error(f"Failed to check existing skills prefix: {e}")
-        raise
-
+    local_keys: set[str] = set()
     uploaded = 0
     failed = 0
+
     for root, dirs, files in os.walk(SKILLS_DIR):
         dirs[:] = [d for d in dirs if d not in {"__pycache__", ".git", "node_modules"}]
         for filename in files:
@@ -665,6 +671,7 @@ def upload_skills_to_s3(s3_bucket_name: str) -> int:
             if _should_skip_skill_path(rel_path):
                 continue
             s3_key = f"{SKILLS_S3_PREFIX}/{rel_path.replace(os.sep, '/')}"
+            local_keys.add(s3_key)
             content_type, _ = mimetypes.guess_type(local_path)
             upload_kwargs = {}
             if content_type:
@@ -684,13 +691,36 @@ def upload_skills_to_s3(s3_bucket_name: str) -> int:
 
     if failed:
         raise RuntimeError(
-            f"Skills upload incomplete: {uploaded} ok, {failed} failed "
+            f"Skills sync incomplete: {uploaded} ok, {failed} failed "
             f"(from {SKILLS_DIR})"
         )
 
+    deleted = 0
+    try:
+        remote_keys = _list_s3_keys(s3_bucket_name, prefix)
+    except ClientError as e:
+        logger.error(f"Failed to list remote skills for prune: {e}")
+        raise
+
+    stale = [k for k in remote_keys if k not in local_keys]
+    for s3_key in stale:
+        try:
+            s3_client.delete_object(Bucket=s3_bucket_name, Key=s3_key)
+            deleted += 1
+            logger.debug(f"  deleted: s3://{s3_bucket_name}/{s3_key}")
+        except ClientError as e:
+            failed += 1
+            logger.error(f"  delete failed: {s3_key}: {e}")
+
+    if failed:
+        raise RuntimeError(
+            f"Skills sync prune incomplete: {deleted} deleted, {failed} failed "
+            f"(from s3://{s3_bucket_name}/{prefix})"
+        )
+
     logger.info(
-        f"✓ Uploaded {uploaded} skill file(s) to "
-        f"s3://{s3_bucket_name}/{SKILLS_S3_PREFIX}/"
+        f"✓ Synced skills to s3://{s3_bucket_name}/{SKILLS_S3_PREFIX}/ "
+        f"({uploaded} uploaded, {deleted} deleted)"
     )
     return uploaded
 

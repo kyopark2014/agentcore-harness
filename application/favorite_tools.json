@@ -1,9 +1,7 @@
 {
   "MCP": [
     "websearch",
-    "aws_documentation",
-    "browser-use",
-    "code interpreter"
+    "aws_documentation"
   ],
   "SKILL": [
     "docx",
