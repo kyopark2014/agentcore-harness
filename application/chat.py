@@ -22,13 +22,13 @@ bedrock_region = config['region']
 accountId = config['accountId']
 projectName = config['projectName']
 
-model_name = "Claude 4.5 Haiku"
+model_name = "Claude 5.0 Sonnet"
 model_type = "claude"
 models = info.get_model_info(model_name)
 model_id = models[0]["model_id"]
 
 # runtime_session_id = str(uuid.uuid4())
-runtime_session_id = "langgraph"
+runtime_session_id = "agentcore"
 logger.info(f"runtime_session_id: {runtime_session_id}")
 user_id = None 
 
@@ -42,15 +42,29 @@ debug_mode = 'Disable'
 def update(modelName):
     global model_name, models, model_type, model_id
 
-    if modelName is not model_name:
+    if modelName != model_name:
         model_name = modelName
         logger.info(f"modelName: {modelName}")
 
         models = info.get_model_info(model_name)
+        if not models:
+            logger.error(f"Unknown model: {modelName}")
+            return
         model_type = models[0]["model_type"]
         model_id = models[0]["model_id"]
         logger.info(f"model_id: {model_id}")
         logger.info(f"model_type: {model_type}")
+
+
+def harness_model_config() -> dict:
+    """Build InvokeHarness ``model`` override from the selected chat profile."""
+    profile = models[0] if models else {}
+    mid = profile.get("model_id") or model_id
+    bedrock_cfg: dict = {"modelId": mid}
+    api_format = profile.get("mantle_api") or profile.get("apiFormat")
+    if api_format:
+        bedrock_cfg["apiFormat"] = api_format
+    return {"bedrockModelConfig": bedrock_cfg}
 
 def get_chat(extended_thinking=None):
     # Set default value if not provided or invalid
