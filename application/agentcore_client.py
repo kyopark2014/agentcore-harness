@@ -602,7 +602,9 @@ def run_harness(prompt, notification_queue=None, skill_list=None, mcp_servers=No
             [],
         )
 
-    actor_id = (projectName or "harness").replace("-", "_")
+    import chat as chat_mod
+
+    actor_id = chat_mod.harness_actor_id()
     system_prompt = build_harness_system_prompt(actor_id)
 
     try:
@@ -622,8 +624,6 @@ def run_harness(prompt, notification_queue=None, skill_list=None, mcp_servers=No
 
         skills = skill_mod.build_harness_skills(skill_list or [])
         tools = mcp_config.build_harness_tools(mcp_servers or [])
-
-        import chat as chat_mod
 
         model_cfg = chat_mod.harness_model_config()
         logger.info(f"invoke_harness skills: {skills}")

@@ -176,7 +176,16 @@ def retrieve(query: str, actor_id: str | None = None, user_id: str | None = None
         if "s3Location" in location:
             uri = (location["s3Location"] or {}).get("uri") or ""
             name = uri.split("/")[-1] if uri else None
-            if sharing_url and name:
+            # Prefer full key after bucket (docs/{actor_id}/file) for sharing URL
+            rel = ""
+            if uri.startswith("s3://"):
+                parts = uri[5:].split("/", 1)
+                rel = parts[1] if len(parts) == 2 else ""
+            if sharing_url and rel:
+                # quote each path segment, keep slashes
+                quoted = "/".join(quote(seg) for seg in rel.split("/"))
+                url = f"{sharing_url}/{quoted}"
+            elif sharing_url and name:
                 url = f"{sharing_url}/{doc_prefix}{quote(name)}"
             else:
                 url = uri

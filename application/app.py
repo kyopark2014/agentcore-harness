@@ -32,6 +32,33 @@ mode_descriptions = {
 
 uploaded_file = None
 
+# ---- Entry: require user_id (used as actor_id) before the main UI ----
+if "user_id" not in st.session_state:
+    st.session_state.user_id = ""
+
+if not st.session_state.user_id:
+    st.title("🔮 사용자 아이디 입력")
+    st.markdown(
+        "시작하려면 아이디를 입력하세요. "
+    )
+    with st.form("login_form", clear_on_submit=False):
+        login_id = st.text_input(
+            "아이디",
+            placeholder="예: user01",
+            help="영문·숫자·._- 만 사용하세요. 그 외 문자는 _ 로 치환됩니다.",
+        )
+        submitted = st.form_submit_button("시작", type="primary")
+    if submitted:
+        chat.set_user_id(login_id)
+        if not chat.user_id:
+            st.error("아이디를 입력해주세요.")
+        else:
+            st.session_state.user_id = chat.user_id
+            st.rerun()
+    st.stop()
+
+chat.set_user_id(st.session_state.user_id)
+
 with st.sidebar:
     st.title("🔮 Menu")
 
@@ -40,6 +67,16 @@ with st.sidebar:
         "여기에서는 SKILL과 MCP를 이용해 agent의 기능을 확장합니다.\n"
         "상세한 코드는 [Github](https://github.com/kyopark2014/agentcore-harness)을 참조하세요."
     )
+
+    st.subheader("👤 사용자")
+    st.info(f"아이디: `{st.session_state.user_id}`")
+    if st.button("아이디 변경", key="change_user_id"):
+        st.session_state.user_id = ""
+        st.session_state.messages = []
+        st.session_state.greetings = False
+        chat.set_user_id(None)
+        chat.initiate()
+        st.rerun()
 
     st.subheader("🐱 대화 형태")
 
@@ -188,6 +225,7 @@ display_chat_messages()
 if not st.session_state.greetings:
     with st.chat_message("assistant"):
         intro = (
+            f"안녕하세요, `{st.session_state.user_id}`님. "
             "아마존 베드락을 이용하여 주셔서 감사합니다. "
             "왼쪽에서 Skill과 MCP를 선택한 뒤 대화를 시작하세요. "
             "문서를 업로드하면 Knowledge Base에 동기화됩니다."
@@ -210,8 +248,11 @@ if uploaded_file is not None and clear_button is False:
         logger.info(f"uploading... file_name: {file_name}")
         st.info(f'선택한 파일 "{file_name}"을 업로드합니다.')
 
-        file_url = chat.upload_to_s3(uploaded_file.getvalue(), file_name)
-        logger.info(f"file_url: {file_url}")
+        actor_id = chat.harness_actor_id()
+        file_url = chat.upload_to_s3(
+            uploaded_file.getvalue(), file_name, actor_id=actor_id
+        )
+        logger.info(f"file_url: {file_url} (actor_id={actor_id})")
 
         if not file_url:
             st.error(f'"{file_name}" S3 업로드에 실패했습니다.')

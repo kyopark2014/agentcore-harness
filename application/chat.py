@@ -1,10 +1,12 @@
 import boto3
+import json
 import uuid
 import logging
 import sys
 import info
 import utils
 from urllib import parse
+from datetime import datetime, timezone
 
 from langchain_aws import ChatBedrock
 from botocore.config import Config
@@ -74,8 +76,65 @@ def harness_model_config() -> dict:
     return {"bedrockModelConfig": bedrock_cfg}
 
 
-def upload_to_s3(file_bytes, file_name):
-    """Upload a file to S3 under docs/ or images/ and return the sharing URL."""
+def _sanitize_actor_segment(actor_id: str | None) -> str:
+    raw = (actor_id or "").strip()
+    if not raw:
+        return ""
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in raw)
+
+
+def set_user_id(uid: str | None) -> None:
+    """Set the UI login id used as InvokeHarness actorId / KB owner."""
+    global user_id
+    sanitized = _sanitize_actor_segment(uid)
+    user_id = sanitized or None
+    logger.info(f"user_id: {user_id}")
+
+
+def harness_actor_id() -> str:
+    """Same actor_id used by InvokeHarness / KB retrieve owner filter.
+
+    Prefers the UI-entered user_id; falls back to projectName.
+    """
+    if user_id:
+        return user_id
+    return (projectName or "harness").replace("-", "_")
+
+
+def _kb_owner_metadata_bytes(actor_id: str) -> bytes:
+    """Bedrock KB sidecar: owner STRING_LIST for retrieve listContains filter."""
+    doc = {
+        "metadataAttributes": {
+            "owner": {
+                "value": {"type": "STRING_LIST", "stringListValue": [actor_id]},
+                "includeForEmbedding": False,
+            },
+            "team": {
+                "value": {"type": "STRING", "stringValue": "default"},
+                "includeForEmbedding": False,
+            },
+            "created_time": {
+                "value": {
+                    "type": "NUMBER",
+                    "numberValue": int(datetime.now(timezone.utc).timestamp()),
+                },
+                "includeForEmbedding": False,
+            },
+            "is_confidential": {
+                "value": {"type": "BOOLEAN", "booleanValue": False},
+                "includeForEmbedding": False,
+            },
+        }
+    }
+    return json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def upload_to_s3(file_bytes, file_name, actor_id: str | None = None):
+    """Upload a file to S3 under docs/{actor_id}/ (or images/) and return the sharing URL.
+
+    For non-image docs also uploads ``{file}.metadata.json`` with owner=actor_id so
+    Knowledge Base retrieve's listContains(owner) filter can match.
+    """
     try:
         s3_client = boto3.client(
             service_name="s3",
@@ -85,12 +144,24 @@ def upload_to_s3(file_bytes, file_name):
         content_type = utils.get_contents_type(file_name)
         logger.info(f"content_type: {content_type}")
 
+        uid = _sanitize_actor_segment(actor_id) or harness_actor_id()
+        logger.info(f"upload actor_id: {uid}")
+
         if content_type.startswith("image/"):
-            s3_key = f"{s3_image_prefix}/{file_name}"
-            url_path = f"{s3_image_prefix}/{parse.quote(file_name)}"
+            if uid:
+                s3_key = f"{s3_image_prefix}/{uid}/{file_name}"
+                url_path = f"{s3_image_prefix}/{parse.quote(uid)}/{parse.quote(file_name)}"
+            else:
+                s3_key = f"{s3_image_prefix}/{file_name}"
+                url_path = f"{s3_image_prefix}/{parse.quote(file_name)}"
         else:
-            s3_key = f"{s3_prefix}/{file_name}"
-            url_path = f"{s3_prefix}/{parse.quote(file_name)}"
+            # docs/{actor_id}/{file} — must match retrieve owner filter / MCP docs path
+            if uid:
+                s3_key = f"{s3_prefix}/{uid}/{file_name}"
+                url_path = f"{s3_prefix}/{parse.quote(uid)}/{parse.quote(file_name)}"
+            else:
+                s3_key = f"{s3_prefix}/{file_name}"
+                url_path = f"{s3_prefix}/{parse.quote(file_name)}"
 
         put_params = {
             "Bucket": s3_bucket,
@@ -103,9 +174,25 @@ def upload_to_s3(file_bytes, file_name):
         }
         if content_type != "no info":
             put_params["ContentType"] = content_type
+        if content_type == "application/pdf":
+            put_params["ContentDisposition"] = "inline"
 
         response = s3_client.put_object(**put_params)
         logger.info(f"upload response: {response}")
+
+        # KB metadata sidecar next to the document (required for owner filter)
+        if uid and not content_type.startswith("image/") and not file_name.endswith(
+            ".metadata.json"
+        ):
+            meta_key = f"{s3_key}.metadata.json"
+            meta_body = _kb_owner_metadata_bytes(uid)
+            s3_client.put_object(
+                Bucket=s3_bucket,
+                Key=meta_key,
+                Body=meta_body,
+                ContentType="application/json",
+            )
+            logger.info(f"uploaded KB metadata sidecar: {meta_key} owner={uid}")
 
         if path:
             return f"{path}/{url_path}"
