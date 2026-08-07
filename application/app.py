@@ -30,6 +30,8 @@ mode_descriptions = {
     ],
 }
 
+uploaded_file = None
+
 with st.sidebar:
     st.title("🔮 Menu")
 
@@ -150,6 +152,13 @@ with st.sidebar:
     chat.update(modelName)
     st.success(f"Connected to {modelName}", icon="💚")
 
+    st.subheader("📋 문서 업로드 (Knowledge Base)")
+    uploaded_file = st.file_uploader(
+        "RAG를 위한 파일을 선택합니다.",
+        type=["pdf", "txt", "py", "md", "csv", "json", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "html", "png", "jpg", "jpeg"],
+        key=chat.fileId,
+    )
+
     clear_button = st.button("대화 초기화", key="clear")
 
 st.title("🔮 " + mode)
@@ -180,7 +189,8 @@ if not st.session_state.greetings:
     with st.chat_message("assistant"):
         intro = (
             "아마존 베드락을 이용하여 주셔서 감사합니다. "
-            "왼쪽에서 Skill과 MCP를 선택한 뒤 대화를 시작하세요."
+            "왼쪽에서 Skill과 MCP를 선택한 뒤 대화를 시작하세요. "
+            "문서를 업로드하면 Knowledge Base에 동기화됩니다."
         )
         st.markdown(intro)
         st.session_state.messages.append({"role": "assistant", "content": intro})
@@ -191,6 +201,41 @@ if clear_button or "messages" not in st.session_state:
     st.session_state.greetings = False
     chat.initiate()
     st.rerun()
+
+# Upload to S3 and sync Knowledge Base (agent-plugins pattern)
+if uploaded_file is not None and clear_button is False:
+    if uploaded_file.name:
+        chat.initiate()
+        file_name = uploaded_file.name
+        logger.info(f"uploading... file_name: {file_name}")
+        st.info(f'선택한 파일 "{file_name}"을 업로드합니다.')
+
+        file_url = chat.upload_to_s3(uploaded_file.getvalue(), file_name)
+        logger.info(f"file_url: {file_url}")
+
+        if not file_url:
+            st.error(f'"{file_name}" S3 업로드에 실패했습니다.')
+        else:
+            sync_result = utils.sync_data_source()
+            if sync_result:
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            f'선택한 문서("{file_name}")를 S3에 업로드했고 '
+                            f"Knowledge Base 동기화(ingestion)를 시작했습니다.\n\n"
+                            f"- URL: {file_url}\n"
+                            f"- job: {sync_result.get('ingestion_job_id', '')}\n"
+                            f"- status: {sync_result.get('status', '')}"
+                        ),
+                    }
+                )
+                st.rerun()
+            else:
+                st.error(
+                    f'"{file_name}" 업로드는 되었지만 Knowledge Base 동기화에 실패했습니다. '
+                    "config.json의 knowledge_base_id / data_source_id를 확인하세요."
+                )
 
 if prompt := st.chat_input("메시지를 입력하세요."):
     with st.chat_message("user"):
