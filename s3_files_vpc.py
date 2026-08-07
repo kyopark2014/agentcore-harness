@@ -485,21 +485,78 @@ class S3FilesVpcProvisioner:
             time.sleep(15)
         return role_arn
 
-    def _find_file_system(self, s3_bucket_arn: str) -> Optional[Dict[str, str]]:
+    def _find_file_system(
+        self,
+        s3_bucket_arn: str,
+        *,
+        vpc_id: str | None = None,
+    ) -> Optional[Dict[str, str]]:
+        """Prefer this project's FS; else same-bucket FS only if mounts are in vpc_id."""
+        preferred_name = f"s3files-for-{self.project_name}"
+        bucket_matches: list[Dict[str, str]] = []
         paginator = self.s3files.get_paginator("list_file_systems")
         for page in paginator.paginate():
             for item in page.get("fileSystems", []):
-                if item.get("bucket") == s3_bucket_arn:
-                    return {
-                        "file_system_id": item.get("fileSystemId", ""),
-                        "file_system_arn": item.get("fileSystemArn", ""),
-                    }
+                if item.get("bucket") != s3_bucket_arn:
+                    continue
+                info = {
+                    "file_system_id": item.get("fileSystemId", ""),
+                    "file_system_arn": item.get("fileSystemArn", ""),
+                    "name": item.get("name") or "",
+                }
+                if not info["file_system_id"]:
+                    continue
+                if info["name"] == preferred_name:
+                    return info
+                # Resolve Name tag via get when list omits tags
+                try:
+                    detail = self.s3files.get_file_system(
+                        fileSystemId=info["file_system_id"]
+                    )
+                    for tag in detail.get("tags") or []:
+                        if (
+                            tag.get("key") == "Name"
+                            and tag.get("value") == preferred_name
+                        ):
+                            return info
+                    if detail.get("name") == preferred_name:
+                        return info
+                except ClientError:
+                    pass
+                bucket_matches.append(info)
+
+        if not vpc_id:
+            return bucket_matches[0] if bucket_matches else None
+
+        for info in bucket_matches:
+            if self._file_system_has_mount_in_vpc(info["file_system_id"], vpc_id):
+                return info
         return None
 
+    def _file_system_has_mount_in_vpc(self, file_system_id: str, vpc_id: str) -> bool:
+        paginator = self.s3files.get_paginator("list_mount_targets")
+        subnet_ids: list[str] = []
+        for page in paginator.paginate(fileSystemId=file_system_id):
+            for mt in page.get("mountTargets") or []:
+                sid = mt.get("subnetId")
+                if sid:
+                    subnet_ids.append(sid)
+        if not subnet_ids:
+            return True  # no mounts yet — safe to attach to this VPC
+        try:
+            subs = self.ec2.describe_subnets(SubnetIds=subnet_ids).get("Subnets") or []
+        except ClientError:
+            return False
+        return all(s.get("VpcId") == vpc_id for s in subs)
+
     def _get_or_create_file_system(
-        self, s3_bucket_arn: str, role_arn: str
+        self,
+        s3_bucket_arn: str,
+        role_arn: str,
+        *,
+        vpc_id: str | None = None,
     ) -> Dict[str, str]:
-        existing = self._find_file_system(s3_bucket_arn)
+        existing = self._find_file_system(s3_bucket_arn, vpc_id=vpc_id)
         if existing and existing.get("file_system_id"):
             self.logger.info(
                 f"  Reusing S3 Files file system: {existing['file_system_id']}"
@@ -702,7 +759,9 @@ class S3FilesVpcProvisioner:
 
         s3_bucket_arn = f"arn:aws:s3:::{s3_bucket_name}"
         sync_role_arn = self._get_or_create_sync_role(s3_bucket_arn)
-        file_system = self._get_or_create_file_system(s3_bucket_arn, sync_role_arn)
+        file_system = self._get_or_create_file_system(
+            s3_bucket_arn, sync_role_arn, vpc_id=vpc_id
+        )
         file_system_id = file_system["file_system_id"]
 
         harness_sg_id = self.create_security_group(
