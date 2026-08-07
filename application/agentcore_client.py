@@ -529,6 +529,48 @@ def _json_preview(obj, max_len: int = 2400) -> str:
     return s
 
 
+_HARNESS_SYSTEM_PROMPT_BASE = (
+    "당신의 이름은 서연이고, 질문에 친근한 방식으로 대답하도록 설계된 대화형 AI입니다.\n"
+    "상황에 맞는 구체적인 세부 정보를 충분히 제공합니다.\n"
+    "모르는 질문을 받으면 솔직히 모른다고 말합니다.\n"
+    "한국어로 답변하세요.\n"
+    "\n"
+    "## Agent Workflow\n"
+    "1. 사용자 입력을 받는다\n"
+    "2. 요청에 맞는 skill/도구가 있으면 해당 지침에 따라 작업을 수행한다\n"
+    "3. 코드 실행·파일 생성 시 반드시 ARTIFACTS_DIR(actor별 폴더) 아래에 산출물을 저장한다\n"
+    "4. 결과 파일이 있으면 artifact-share MCP의 share_artifact로 공유 URL을 제공한다 "
+    "(filepath는 'artifacts/파일명' 또는 ARTIFACTS_DIR 절대경로; actor_id 필수; "
+    "세션 스토리지에서 artifacts/{actor_id}/... 로 복사된다)\n"
+    "5. 최종 결과를 사용자에게 전달한다\n"
+)
+
+
+def build_harness_system_prompt(actor_id: str | None = None) -> list[dict]:
+    """Build InvokeHarness systemPrompt with actor_id and ARTIFACTS_DIR paths."""
+    text = _HARNESS_SYSTEM_PROMPT_BASE
+    aid = (actor_id or "").strip()
+    if aid:
+        artifacts_dir = f"/mnt/workspace/{aid}/artifacts"
+        text += (
+            "\n"
+            f"actor_id: {aid}\n"
+            "\n"
+            "## Paths (use absolute paths when writing files)\n"
+            f"- SESSION_STORAGE_DIR: /mnt/workspace\n"
+            f"- ARTIFACTS_DIR: {artifacts_dir}\n"
+            f"모든 산출물(PDF, DOCX, PNG, CSV, drawio 등)은 반드시 ARTIFACTS_DIR "
+            f"({artifacts_dir}) 아래에 생성하세요. "
+            f"다른 actor의 폴더나 /mnt/workspace 루트에 쓰지 마세요.\n"
+            f"Example: write/save to '{artifacts_dir}/report.pdf'\n"
+            "\n"
+            "knowledge-base ``retrieve``와 artifact-share ``share_artifact``를 "
+            f"호출할 때 actor_id 인자에는 반드시 위 값(\"{aid}\")을 그대로 사용하세요. "
+            "닉네임·표시 이름·추측 값으로 바꾸지 마세요.\n"
+        )
+    return [{"text": text}]
+
+
 def run_harness(prompt, notification_queue=None, skill_list=None, mcp_servers=None):
     """
     Run the provisioned AgentCore Harness (deployment/test_invoke_harness.py shape).
@@ -560,7 +602,8 @@ def run_harness(prompt, notification_queue=None, skill_list=None, mcp_servers=No
             [],
         )
 
-    actor_id = projectName.replace("-", "_")
+    actor_id = (projectName or "harness").replace("-", "_")
+    system_prompt = build_harness_system_prompt(actor_id)
 
     try:
         import skill as skill_mod
@@ -586,6 +629,7 @@ def run_harness(prompt, notification_queue=None, skill_list=None, mcp_servers=No
         logger.info(f"invoke_harness skills: {skills}")
         logger.info(f"invoke_harness tools: {tools}")
         logger.info(f"invoke_harness model: {model_cfg}")
+        logger.info(f"invoke_harness actor_id: {actor_id}")
         logger.debug(
             f"invoke_harness: harnessArn: {harness_arn}, session: {runtime_session_id}, "
             f"actorId: {actor_id}, prompt_len: {len(prompt or '')}"
@@ -596,6 +640,7 @@ def run_harness(prompt, notification_queue=None, skill_list=None, mcp_servers=No
             "runtimeSessionId": runtime_session_id,
             "actorId": actor_id,
             "model": model_cfg,
+            "systemPrompt": system_prompt,
             "messages": [
                 {
                     "role": "user",
@@ -732,10 +777,6 @@ def run_harness(prompt, notification_queue=None, skill_list=None, mcp_servers=No
                                 tool_input_buffers[tid] = (
                                     tool_input_buffers.get(tid, "") + tin
                                 )
-                                logger.info(
-                                    f"[tool_input] {name}, toolUseId: {tid}, "
-                                    f"input: {_json_preview(tool_input_buffers[tid], 4000)}"
-                                )
                                 if notification_queue is not None:
                                     tool_slot_update(
                                         notification_queue,
@@ -743,7 +784,7 @@ def run_harness(prompt, notification_queue=None, skill_list=None, mcp_servers=No
                                         f"Tool: {name}, Input: {tool_input_buffers[tid]}",
                                     )
                             else:
-                                logger.info(
+                                logger.debug(
                                     f"[tool_input_delta] contentBlockIndex: {idx}, "
                                     f"fragment: {_json_preview(tin, 1600)}"
                                 )
@@ -807,10 +848,21 @@ def run_harness(prompt, notification_queue=None, skill_list=None, mcp_servers=No
 
                 elif "contentBlockStop" in event:
                     cbe = event["contentBlockStop"]
+                    idx = cbe.get("contentBlockIndex")
                     logger.debug(
-                        f"contentBlockStop: contentBlockIndex: {cbe.get('contentBlockIndex')}, "
+                        f"contentBlockStop: contentBlockIndex: {idx}, "
                         f"full: {_json_preview(cbe, 800)}"
                     )
+                    # Log final tool input once when the block completes
+                    if idx is not None:
+                        pair = block_tool_use.get(idx)
+                        if pair:
+                            tid, name = pair
+                            final_input = tool_input_buffers.get(tid, "")
+                            logger.info(
+                                f"[tool_input] {name}, toolUseId: {tid}, "
+                                f"input: {_json_preview(final_input, 4000)}"
+                            )
 
                 elif "messageStop" in event:
                     ms = event["messageStop"]

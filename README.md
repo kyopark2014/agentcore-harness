@@ -2,13 +2,15 @@
 
 AgentCore의 관리형 에이전트 하네스(Managed Agent Harness)는 사전 구축 작업을 단순한 설정(configuration)으로 대체합니다.
 
-이 저장소는 **인프라 프로비저닝(`installer.py`)** 과 **Streamlit UI(`application/`)** 로 구성됩니다. Harness는 VPC 모드 + Amazon S3 Files 마운트로 세션 스토리지를 붙이고, UI에서 고른 Skill·MCP·모델을 `InvokeHarness` 호출마다 override합니다.
+이 저장소는 **인프라 프로비저닝(`installer.py`)** 과 **Streamlit UI(`application/`)** 로 구성됩니다. Harness는 **VPC 모드 + Amazon S3 Files** 마운트로 세션 스토리지를 붙이고, UI에서 고른 Skill·MCP·모델을 `InvokeHarness` 호출마다 override합니다.
 
 ## 주요 특징
 
 - 모든 세션이 Firecracker microVM에서 격리 실행
 - 세션별 독립 파일시스템 & 셸
 - **S3 Files**로 `/mnt/workspace` 영속 마운트 (VPC 필수)
+- **Knowledge Base MCP**: S3 Vectors KB → AgentCore Runtime(MCP) → 공유 IAM Gateway
+- **artifact-share MCP**: 세션 산출물 → CloudFront 공유 URL (동일 Gateway)
 - **Skill**: Git(Anthropic 공식) 또는 S3 URI로 런타임에 주입
 - **MCP / Browser / Code Interpreter**: UI 선택 → `tools` 배열로 전달
 - **모델**: 사이드바 선택 → `model.bedrockModelConfig`로 호출마다 override
@@ -19,16 +21,22 @@ AWS 오픈소스 에이전트 프레임워크 [Strands Agents](https://strandsag
 
 ## Operation Architecture
 
-로컬 UI는 Strands SDK를 직접 실행하지 않습니다. `installer.py`가 Control Plane에서 Harness·Memory·VPC·S3 Files를 만들고, `run_harness`가 Data Plane `InvokeHarness`로 호출합니다.
+로컬 UI는 Strands SDK를 직접 실행하지 않습니다. `installer.py`가 Control Plane에서 Harness·VPC·S3 Files·S3 Vectors KB·공유 MCP Gateway를 만들고, `run_harness`가 Data Plane `InvokeHarness`로 호출합니다.
 
 ```mermaid
 flowchart TB
   INST[installer.py] -->|CreateHarness + VPC + S3 Files| H[AgentCore Harness]
-  INST --> Mem[AgentCore Memory]
-  INST --> S3[(S3 bucket<br/>skills/ · sessions/)]
+  INST --> S3[(S3 bucket<br/>skills/ · docs/ · artifacts/)]
   INST --> VPC[VPC + NAT<br/>private subnets]
-  Mem --> H
+  INST --> KB[S3 Vectors KB]
+  INST --> KBMCP[KB MCP Runtime]
+  INST --> ASMCP[artifact-share MCP]
+  INST --> GW[AgentCore Gateway]
+  S3 --> KB
   S3 -->|S3 Files Access Point<br/>mount /mnt/workspace| H
+  KBMCP --> GW
+  ASMCP --> GW
+  GW --> H
   VPC --> H
 
   App[app.py] --> RH[run_harness]
@@ -39,13 +47,13 @@ flowchart TB
     Model[Bedrock model]
     Skills[S3/Git skills]
     BuiltIn[shell · file_operations]
-    Remote[remote_mcp · browser · code]
     FS["/mnt/workspace S3 Files"]
+    Remote[remote_mcp · browser · code · gateway]
     Loop --> Model
     Loop --> Skills
     Loop --> BuiltIn
-    Loop --> Remote
     Loop --> FS
+    Loop --> Remote
   end
 
   H --> Harness
@@ -54,9 +62,9 @@ flowchart TB
 
 | 단계 | 경로 |
 |------|------|
-| 프로비저닝 | `installer.py` → S3 · skills 업로드 · IAM · Memory · VPC · S3 Files · `CreateHarness` → `application/config.json` |
+| 프로비저닝 | `installer.py` → S3 · skills · S3 Vectors KB · KB + artifact-share MCP + Gateway · VPC · S3 Files · `CreateHarness` → `application/config.json` |
 | 호출 | `app.py` → Skill/MCP/모델 선택 → `run_harness` → `invoke_harness` |
-| 삭제 | `uninstaller.py` → Harness · S3 Files · VPC · Memory · IAM 정리 |
+| 삭제 | `uninstaller.py` → Harness · S3 Files · Gateway · MCP Runtimes · KB · VPC · IAM 정리 |
 
 ---
 
@@ -73,34 +81,54 @@ streamlit run application/app.py
 python uninstaller.py
 ```
 
-`application/config.json`은 gitignore됩니다. installer가 `HARNESS_ARN`, `s3_bucket`, VPC·S3 Files 필드를 채웁니다.
+`application/config.json`은 gitignore됩니다. installer가 `HARNESS_ARN`, `s3_bucket`, VPC·S3 Files, `agentcore_gateway_arn`, `knowledge_base_mcp_*`, `artifact_share_mcp_*` 필드를 채웁니다.
 
 ---
 
-## S3 Files + VPC 설정
+## S3 Files + VPC + MCP Gateway 설정
 
 S3 Files 마운트는 **VPC 네트워크 모드**가 필요합니다. `s3_files_vpc.py`가 VPC(public/private + NAT)·S3 Files 파일시스템·Access Point·보안 그룹을 만들고, `installer.py`가 그 결과를 `CreateHarness`의 `environment`에 넣습니다.
+
+Knowledge Base retrieve와 artifact-share는 IAM 인증 AgentCore Runtime MCP를 **공유 AgentCore Gateway**가 프록시합니다 (`remote_mcp`는 Runtime URL에 SigV4를 붙이지 못해 403이 납니다).
 
 ### 프로비저닝 흐름 (`installer.py`)
 
 ```python
 # installer.py main (요약)
 s3_bucket_name = create_s3_bucket()          # versioning=Enabled (S3 Files 요구)
-upload_skills_to_s3(s3_bucket_name)         # sync skills/ → s3://{bucket}/skills/
-execution_role_arn = create_harness_execution_role()
-# … Memory …
-
-provisioner = S3FilesVpcProvisioner(...)
+upload_skills_to_s3(s3_bucket_name)
+knowledge_base_id, data_source_id = create_knowledge_base_with_s3_vectors(...)
+knowledge_base_mcp_info = deploy_knowledge_base_mcp(...)
+artifact_share_mcp_info = deploy_artifact_share_mcp(..., gateway_info=knowledge_base_mcp_info)
+execution_role_arn = create_harness_execution_role(
+    knowledge_base_mcp_runtime_arn=...,
+    artifact_share_mcp_runtime_arn=...,
+    agentcore_gateway_arn=...,
+)
+provisioner = _s3_files_provisioner()
 vpc_info = provisioner.ensure_vpc()
-s3_files_info = provisioner.create_s3_files_session_storage(
-    vpc_info, s3_bucket_name, execution_role_arn, execution_role_name
-)
+s3_files_info = provisioner.create_s3_files_session_storage(...)
 harness_info = create_or_get_harness(
-    execution_role_arn, agent_memory_arn, s3_files_info=s3_files_info
+    execution_role_arn,
+    s3_files_info=s3_files_info,
+    agentcore_gateway_arn=knowledge_base_mcp_info["agentcore_gateway_arn"],
 )
+# CloudFront 확정 후 ensure_harness_sharing_env + refresh both MCP envs
 ```
 
-### Harness `environment` (VPC + 마운트)
+### Knowledge Base + artifact-share MCP (공유 Gateway)
+
+| 구성 요소 | 설명 |
+|-----------|------|
+| S3 Vectors KB | Bedrock Knowledge Base + vector bucket/index |
+| KB MCP Runtime | `MCP/knowledge-base` Docker → ECR → AgentCore Runtime (MCP protocol) |
+| artifact-share MCP | `MCP/artifact-share` → 세션 키 `agentcore-sessions/...` → `artifacts/...` CopyObject |
+| AgentCore Gateway | AWS_IAM inbound, targets: `knowledge-base`, `artifact-share` |
+| UI 라벨 | `knowledge base` / `artifact-share` → 동일 `agentcore_gateway` tool |
+
+`retrieve` / `share_artifact` — `actor_id`는 InvokeHarness systemPrompt에 실린 값을 그대로 전달합니다.
+
+### Harness `environment` (VPC + S3 Files)
 
 ```python
 # s3_files_vpc.build_harness_runtime_environment
@@ -119,10 +147,8 @@ harness_info = create_or_get_harness(
         },
         "filesystemConfigurations": [
             {
-                "s3FilesAccessPoint": {
-                    "accessPointArn": "arn:aws:s3files:...:access-point/fsap-...",
-                    "mountPath": "/mnt/workspace",
-                }
+                "mountPath": "/mnt/workspace",
+                "s3FilesAccessPoint": {"accessPointArn": "arn:aws:s3files:..."},
             }
         ],
     }
@@ -134,15 +160,20 @@ harness_info = create_or_get_harness(
 ```python
 # installer.create_or_get_harness (요약)
 environment = s3_files_vpc.build_harness_runtime_environment(s3_files_info)
+tools = _default_harness_tools(agentcore_gateway_arn)
 
 agentcore_control_client.create_harness(
     harnessName=harness_name_for_api(project_name),  # '-' → '_'
     executionRoleArn=execution_role_arn,
-    # … model, tools, memory …
+    # … model, tools …
     environment=environment,
     environmentVariables={
         "LOG_LEVEL": "info",
         "SESSION_STORAGE_DIR": "/mnt/workspace",
+        "S3_BUCKET": "...",
+        "SHARING_URL": "https://…cloudfront.net",
+        "KNOWLEDGE_BASE_ID": "...",
+        "DATA_SOURCE_ID": "...",
     },
 )
 ```
@@ -151,24 +182,28 @@ agentcore_control_client.create_harness(
 
 | 영역 | 권한 |
 |------|------|
-| Bedrock | `bedrock:InvokeModel`, `InvokeModelWithResponseStream` |
-| AgentCore | `bedrock-agentcore:*` |
+| Bedrock | `bedrock:InvokeModel`, `InvokeModelWithResponseStream`, KB retrieve/ingest |
+| AgentCore | `bedrock-agentcore:*` (+ Gateway / KB + artifact-share Runtime invoke) |
 | Skill S3 | `s3:ListBucket` / `s3:GetObject` on skills bucket |
-| **VPC ECR pull** | `ecr:GetAuthorizationToken`, `ecr:BatchGetImage`, `GetDownloadUrlForLayer` on `repository/harness-*` |
 | **S3 Files** | `s3files:ClientMount`, `ClientWrite`, `ClientRootAccess`, `GetAccessPoint`, `ListMountTargets` |
+| **VPC ECR pull** | `ecr:GetAuthorizationToken`, `ecr:BatchGetImage`, `GetDownloadUrlForLayer` on `repository/harness-*` |
 
 VPC 모드에서 managed harness 이미지(`…dkr.ecr…/harness-<region>:latest`)를 못 받으면 `Runtime health check failed`가 납니다. ECR 권한이 필수입니다.
 
-### config.json에 저장되는 S3 Files 관련 키
+### config.json에 저장되는 S3 Files / Gateway / MCP 관련 키
 
 ```json
 {
   "vpc_id": "vpc-…",
   "s3_files_file_system_id": "fs-…",
-  "s3_files_access_point_arn": "arn:aws:s3files:…:access-point/fsap-…",
+  "s3_files_access_point_arn": "arn:aws:s3files:…",
   "s3_files_mount_path": "/mnt/workspace",
   "agent_runtime_vpc_subnets": ["subnet-…"],
   "agent_runtime_security_groups": ["sg-…"],
+  "knowledge_base_id": "…",
+  "agentcore_gateway_arn": "arn:aws:bedrock-agentcore:…:gateway/…",
+  "knowledge_base_mcp_runtime_arn": "arn:aws:bedrock-agentcore:…:runtime/…",
+  "artifact_share_mcp_runtime_arn": "arn:aws:bedrock-agentcore:…:runtime/…",
   "HARNESS_ARN": "arn:aws:bedrock-agentcore:…:harness/…"
 }
 ```
@@ -277,32 +312,20 @@ UI 라벨 → Harness `tools` 항목:
 
 ```python
 HARNESS_MCP_CATALOG = {
-    "websearch": {
-        "type": "remote_mcp",
-        "name": "exa",
-        "config": {"remoteMcp": {"url": "https://mcp.exa.ai/mcp"}},
+    "websearch": {...},
+    "aws_documentation": {...},
+    "knowledge base": {  # → agentcore_gateway (config.json ARN)
+        "type": "agentcore_gateway",
+        "name": "knowledge_base",
+        ...
     },
-    "aws_documentation": {
-        "type": "remote_mcp",
-        "name": "aws_knowledge",
-        "config": {
-            "remoteMcp": {"url": "https://knowledge-mcp.global.api.aws"}
-        },
-    },
-    "browser-use": {
-        "type": "agentcore_browser",
-        "name": "browser",
-        "config": {"agentCoreBrowser": {}},
-    },
-    "code interpreter": {
-        "type": "agentcore_code_interpreter",
-        "name": "code",
-        "config": {"agentCoreCodeInterpreter": {}},
-    },
+    "browser-use": {...},
+    "code interpreter": {...},
 }
 ```
 
-`build_harness_tools(selected_labels)`가 위 카탈로그(+ 사용자 정의 JSON)를 합쳐 `tools` 배열을 만듭니다.
+`build_harness_tools(selected_labels)`가 위 카탈로그(+ 사용자 정의 JSON)를 합쳐 `tools` 배열을 만듭니다.  
+`knowledge base` 선택 시 Gateway ARN은 `application/config.json`의 `agentcore_gateway_arn`에서 채웁니다.
 
 ### 사용자 정의 MCP
 
@@ -335,7 +358,7 @@ HARNESS_MCP_CATALOG = {
 
 ### CreateHarness 기본 tools vs Invoke 시 override
 
-`installer`가 Harness를 만들 때 기본 tools(exa, aws_knowledge, browser, code)를 넣습니다. UI에서 고른 목록은 **호출마다** `InvokeHarness(tools=…)`로 override됩니다.
+`installer`가 Harness를 만들 때 기본 tools(exa, aws_knowledge, browser, code, 그리고 Gateway ARN이 있으면 knowledge_base)를 넣습니다. UI에서 고른 목록은 **호출마다** `InvokeHarness(tools=…)`로 override됩니다.
 
 ---
 
@@ -384,12 +407,11 @@ response = client.invoke_harness(**invoke_kwargs)
 |------|------|
 | **기본 모델** | `global.anthropic.claude-opus-4-7` (호출 시 UI 모델로 override) |
 | **systemPrompt** | 한국어 대화형 에이전트 안내 |
-| **Memory** | AgentCore Memory (`agentCoreMemoryConfiguration`) |
 | **대화 윈도우** | `sliding_window`, 최근 50 메시지 |
 | **한도** | `maxIterations=20`, `maxTokens=50000`, `timeoutSeconds=300` |
-| **네트워크** | `VPC` + private subnet + NAT |
-| **파일시스템** | S3 Files → `/mnt/workspace` |
-| **기본 tools** | exa, aws_knowledge, browser, code |
+| **네트워크** | `VPC` + private subnet + NAT + S3 Files → `/mnt/workspace` |
+| **Knowledge Base / 공유** | S3 Vectors + KB MCP + artifact-share MCP + 공유 Gateway |
+| **기본 tools** | exa, aws_knowledge, browser, code, knowledge_base(gateway) |
 | **Skills** | CreateHarness 시 미설정 → Invoke 시 UI 선택으로 주입 |
 
 ---
@@ -436,9 +458,11 @@ response = client.invoke_harness(**invoke_kwargs)
 
 | 경로 | 역할 |
 |---|---|
-| `installer.py` | S3 · skills 업로드 · IAM · Memory · VPC · S3 Files · CreateHarness |
+| `installer.py` | S3 · skills · S3 Vectors KB · KB + artifact-share MCP/Gateway · VPC · S3 Files · CreateHarness |
 | `uninstaller.py` | 위 리소스 삭제 및 config 정리 |
 | `s3_files_vpc.py` | VPC / S3 Files / harness `environment` 빌더 |
+| `MCP/knowledge-base/` | Knowledge Base retrieve MCP (Docker → AgentCore Runtime) |
+| `MCP/artifact-share/` | 산출물 공유 MCP (세션 → CloudFront CopyObject) |
 | `skills/` | 로컬 스킬 소스 (→ S3 `skills/` 또는 Git) |
 | `application/app.py` | Streamlit UI (Skill · MCP · 모델) |
 | `application/agentcore_client.py` | `run_harness` / `invoke_harness` 스트림 처리 |
@@ -454,7 +478,7 @@ response = client.invoke_harness(**invoke_kwargs)
            → skill / mcp_config / chat (선택값 → payload)
            → agentcore_client.run_harness
                  → InvokeHarness (skills · tools · model)
-                       → AgentCore Harness (VPC + /mnt/workspace)
+                       → AgentCore Harness (VPC + /mnt/workspace; KB + artifact-share via Gateway)
 ```
 
 ---
@@ -464,9 +488,10 @@ response = client.invoke_harness(**invoke_kwargs)
 | 기능 | 설명 |
 |---|---|
 | 격리 실행 | Firecracker microVM |
-| IAM 실행 역할 | Bedrock · ECR · S3 · S3 Files 최소 권한 |
+| IAM 실행 역할 | Bedrock · ECR · S3 · S3 Files · Gateway/Runtime invoke |
 | VPC | private subnet + NAT; S3 Files는 VPC 필수 |
-| Memory | `actorId` 스코프 사용자 격리 |
+| KB retrieve | Gateway → KB MCP Runtime; `actor_id`로 owner 필터 |
+| artifact-share | Gateway → artifact-share MCP; 세션 스토리지 → `artifacts/{actor_id}/` |
 
 호출 측: `bedrock-agentcore:InvokeHarness` (+ 관련 runtime 권한).
 

@@ -3,7 +3,8 @@
 AWS Infrastructure Uninstaller for agentcore-harness.
 
 Deletes resources created by installer.py:
-  Harness, Knowledge Base, S3 Vectors, VPC/NAT, CloudFront, S3, IAM roles.
+  Harness, Knowledge Base + artifact-share MCP Runtimes / AgentCore Gateway,
+  Knowledge Base, S3 Vectors, S3 Files, VPC/NAT, CloudFront, S3, IAM roles.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ vector_bucket_name = f"{project_name}-{account_id}"
 s3_client = boto3.client("s3", region_name=region)
 iam_client = boto3.client("iam", region_name=region)
 ec2_client = boto3.client("ec2", region_name=region)
+s3files_client = boto3.client("s3files", region_name=region)
 s3vectors_client = boto3.client("s3vectors", region_name=region)
 cloudfront_client = boto3.client("cloudfront", region_name=region)
 bedrock_agent_client = boto3.client("bedrock-agent", region_name=region)
@@ -84,7 +86,7 @@ def _vpc_name() -> str:
 def load_config() -> Dict:
     global project_name, region, account_id
     global vector_index_name, vector_bucket_name
-    global s3_client, iam_client, ec2_client, s3vectors_client
+    global s3_client, iam_client, ec2_client, s3files_client, s3vectors_client
     global cloudfront_client, bedrock_agent_client, agentcore_control_client
 
     try:
@@ -108,6 +110,7 @@ def load_config() -> Dict:
     s3_client = boto3.client("s3", region_name=region)
     iam_client = boto3.client("iam", region_name=region)
     ec2_client = boto3.client("ec2", region_name=region)
+    s3files_client = boto3.client("s3files", region_name=region)
     s3vectors_client = boto3.client("s3vectors", region_name=region)
     cloudfront_client = boto3.client("cloudfront", region_name=region)
     bedrock_agent_client = boto3.client("bedrock-agent", region_name=region)
@@ -320,6 +323,135 @@ def _resolve_vpc_id(cfg: dict) -> Optional[str]:
     )
     vpcs = resp.get("Vpcs") or []
     return vpcs[0]["VpcId"] if vpcs else None
+
+
+# --- S3 Files ----------------------------------------------------------------
+
+def _is_s3files_not_found(error: ClientError) -> bool:
+    code = error.response["Error"]["Code"]
+    return code in {
+        "ResourceNotFoundException",
+        "FileSystemNotFound",
+        "AccessPointNotFound",
+        "MountTargetNotFound",
+        "NotFound",
+        "404",
+    }
+
+
+def _wait_s3files_gone(describe_fn, id_key: str, resource_id: str, timeout: int = 600):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            resp = describe_fn(**{id_key: resource_id})
+            status = (resp.get("status") or "").lower()
+            if status in {"deleted", "deleting"}:
+                time.sleep(5)
+                continue
+            time.sleep(8)
+        except ClientError as e:
+            if _is_s3files_not_found(e):
+                return
+            raise
+    raise TimeoutError(f"Timed out waiting for S3 Files {resource_id} deletion")
+
+
+def _find_s3files_fs_id(cfg: dict) -> str:
+    if cfg.get("s3_files_file_system_id"):
+        return cfg["s3_files_file_system_id"]
+    bucket_arn = f"arn:aws:s3:::{_bucket_name()}"
+    try:
+        paginator = s3files_client.get_paginator("list_file_systems")
+        for page in paginator.paginate():
+            for item in page.get("fileSystems", []):
+                if item.get("bucket") == bucket_arn:
+                    return item.get("fileSystemId") or ""
+    except ClientError as e:
+        logger.warning(f"  Could not list S3 Files file systems: {e}")
+    return ""
+
+
+def delete_s3files_sync_role():
+    role_name = f"role-s3files-sync-for-{project_name}"
+    if len(role_name) > 64:
+        role_name = role_name[:64]
+    try:
+        for pname in iam_client.list_role_policies(RoleName=role_name).get(
+            "PolicyNames", []
+        ):
+            iam_client.delete_role_policy(RoleName=role_name, PolicyName=pname)
+        iam_client.delete_role(RoleName=role_name)
+        logger.info(f"  ✓ Deleted S3 Files sync role: {role_name}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "NoSuchEntity":
+            logger.warning(f"  Could not delete sync role {role_name}: {e}")
+
+
+def delete_s3_files_session_storage(cfg: dict):
+    logger.info("[3/8] Deleting S3 Files session storage")
+    fs_id = _find_s3files_fs_id(cfg)
+    if not fs_id:
+        logger.info("  No S3 Files file system found")
+        delete_s3files_sync_role()
+        return
+
+    logger.info(f"  File system: {fs_id}")
+
+    try:
+        s3files_client.delete_file_system_policy(fileSystemId=fs_id)
+        logger.info("  ✓ Deleted file system policy")
+    except ClientError as e:
+        if not _is_s3files_not_found(e):
+            logger.warning(f"  Could not delete FS policy: {e}")
+
+    access_point_ids: List[str] = []
+    try:
+        paginator = s3files_client.get_paginator("list_access_points")
+        for page in paginator.paginate(fileSystemId=fs_id):
+            for item in page.get("accessPoints", []):
+                if item.get("accessPointId"):
+                    access_point_ids.append(item["accessPointId"])
+    except ClientError as e:
+        logger.warning(f"  Could not list access points: {e}")
+
+    for ap_id in access_point_ids:
+        try:
+            s3files_client.delete_access_point(accessPointId=ap_id)
+            _wait_s3files_gone(s3files_client.get_access_point, "accessPointId", ap_id)
+            logger.info(f"  ✓ Deleted access point: {ap_id}")
+        except ClientError as e:
+            if not _is_s3files_not_found(e):
+                logger.warning(f"  Could not delete access point {ap_id}: {e}")
+
+    mount_ids: List[str] = []
+    try:
+        paginator = s3files_client.get_paginator("list_mount_targets")
+        for page in paginator.paginate(fileSystemId=fs_id):
+            for item in page.get("mountTargets", []):
+                if item.get("mountTargetId"):
+                    mount_ids.append(item["mountTargetId"])
+    except ClientError as e:
+        logger.warning(f"  Could not list mount targets: {e}")
+
+    for mt_id in mount_ids:
+        try:
+            s3files_client.delete_mount_target(mountTargetId=mt_id)
+            _wait_s3files_gone(s3files_client.get_mount_target, "mountTargetId", mt_id)
+            logger.info(f"  ✓ Deleted mount target: {mt_id}")
+        except ClientError as e:
+            if not _is_s3files_not_found(e):
+                logger.warning(f"  Could not delete mount target {mt_id}: {e}")
+
+    try:
+        s3files_client.delete_file_system(fileSystemId=fs_id, forceDelete=True)
+        _wait_s3files_gone(s3files_client.get_file_system, "fileSystemId", fs_id)
+        logger.info(f"  ✓ Deleted file system: {fs_id}")
+    except ClientError as e:
+        if not _is_s3files_not_found(e):
+            logger.warning(f"  Could not delete file system {fs_id}: {e}")
+
+    delete_s3files_sync_role()
+    logger.info("✓ S3 Files session storage deleted")
 
 
 def delete_vpc(cfg: dict):
@@ -574,12 +706,229 @@ def delete_iam_roles():
     logger.info("  Deleting IAM roles")
     harness_role = f"role-harness-for-{project_name}-{region}"
     kb_role = f"role-knowledge-base-for-{project_name}-{region}"
+    kb_mcp_role = f"role-kb-mcp-for-{project_name}-{region}"
+    s3_mcp_role = f"role-artifact-share-mcp-for-{project_name}-{region}"
+    gateway_role = f"role-agentcore-gateway-for-{project_name}-{region}"
     delete_iam_role(harness_role)
     delete_iam_role(kb_role)
+    delete_iam_role(kb_mcp_role)
+    delete_iam_role(s3_mcp_role)
+    delete_iam_role(f"role-s3-mcp-for-{project_name}-{region}")  # legacy
+    delete_iam_role(gateway_role)
     # Best-effort cleanup of legacy roles from older installer versions
     delete_iam_role(f"role-agentcore-memory-for-{project_name}-{region}")
-    delete_iam_role(f"role-s3files-sync-for-{project_name}")
+    delete_iam_role(f"role-kb-mcp-gw-for-{project_name}-{region}")
+    delete_s3files_sync_role()
     logger.info("✓ IAM roles processed")
+
+
+def _kb_mcp_runtime_name() -> str:
+    return f"knowledge_base_of_{project_name}".replace("-", "_")
+
+
+def _agentcore_gateway_name() -> str:
+    return project_name[:48]
+
+
+def delete_agentcore_gateway(cfg: Dict):
+    """Delete the shared project AgentCore Gateway and its targets."""
+    logger.info("  Deleting project AgentCore Gateway")
+    gateway_name = _agentcore_gateway_name()
+    gateway_id = (
+        cfg.get("agentcore_gateway_id")
+        or cfg.get("knowledge_base_mcp_gateway_id")
+        or ""
+    )
+
+    try:
+        if not gateway_id:
+            next_token = None
+            while True:
+                kwargs = {}
+                if next_token:
+                    kwargs["nextToken"] = next_token
+                resp = agentcore_control_client.list_gateways(**kwargs)
+                for item in resp.get("items") or []:
+                    if item.get("name") == gateway_name:
+                        gateway_id = item["gatewayId"]
+                        break
+                if gateway_id:
+                    break
+                next_token = resp.get("nextToken")
+                if not next_token:
+                    break
+
+        if not gateway_id:
+            logger.info(f"  No AgentCore Gateway named {gateway_name}")
+            return
+
+        try:
+            targets = agentcore_control_client.list_gateway_targets(
+                gatewayIdentifier=gateway_id
+            ).get("items") or []
+            for target in targets:
+                tid = target.get("targetId")
+                if not tid:
+                    continue
+                try:
+                    agentcore_control_client.delete_gateway_target(
+                        gatewayIdentifier=gateway_id,
+                        targetId=tid,
+                    )
+                    logger.info(f"  ✓ Deleted gateway target: {tid}")
+                except ClientError as e:
+                    logger.warning(f"  Could not delete gateway target {tid}: {e}")
+        except ClientError as e:
+            logger.warning(f"  Could not list/delete gateway targets: {e}")
+
+        agentcore_control_client.delete_gateway(gatewayIdentifier=gateway_id)
+        logger.info(f"  ✓ Deleted AgentCore Gateway: {gateway_id}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceNotFoundException":
+            logger.info(f"  Gateway already gone: {gateway_id or gateway_name}")
+        else:
+            logger.warning(f"  Could not delete AgentCore Gateway: {e}")
+    except Exception as e:
+        logger.warning(f"  Could not delete AgentCore Gateway: {e}")
+
+
+def delete_knowledge_base_mcp_runtime(cfg: Dict):
+    """Delete Knowledge Base MCP AgentCore Runtime and its ECR repository."""
+    logger.info("  Deleting Knowledge Base MCP Runtime")
+    runtime_name = _kb_mcp_runtime_name()
+    arn = cfg.get("knowledge_base_mcp_runtime_arn") or ""
+
+    try:
+        next_token = None
+        runtime_id = None
+        while True:
+            kwargs = {}
+            if next_token:
+                kwargs["nextToken"] = next_token
+            response = agentcore_control_client.list_agent_runtimes(**kwargs)
+            for item in response.get("agentRuntimes", []):
+                if item.get("agentRuntimeName") == runtime_name or (
+                    arn and item.get("agentRuntimeArn") == arn
+                ):
+                    runtime_id = item.get("agentRuntimeId")
+                    break
+            if runtime_id:
+                break
+            next_token = response.get("nextToken")
+            if not next_token:
+                break
+
+        if runtime_id:
+            logger.info(f"  Deleting agent runtime: {runtime_name} ({runtime_id})")
+            try:
+                agentcore_control_client.delete_agent_runtime(agentRuntimeId=runtime_id)
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "ResourceNotFoundException":
+                    logger.warning(f"  Could not delete agent runtime: {e}")
+            deadline = time.time() + 300
+            while time.time() < deadline:
+                try:
+                    agentcore_control_client.get_agent_runtime(agentRuntimeId=runtime_id)
+                    time.sleep(5)
+                except ClientError as e:
+                    if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                        break
+                    raise
+            logger.info(f"  ✓ Deleted Knowledge Base MCP Runtime: {runtime_name}")
+        else:
+            logger.info(f"  No Knowledge Base MCP Runtime named {runtime_name}")
+    except Exception as e:
+        logger.warning(f"  Could not delete Knowledge Base MCP Runtime: {e}")
+
+    repo = cfg.get("knowledge_base_mcp_ecr_repository") or runtime_name
+    try:
+        ecr = boto3.client("ecr", region_name=region)
+        ecr.delete_repository(repositoryName=repo, force=True)
+        logger.info(f"  ✓ Deleted ECR repository: {repo}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "RepositoryNotFoundException":
+            logger.info(f"  ECR repository not found: {repo}")
+        else:
+            logger.warning(f"  Could not delete ECR repository {repo}: {e}")
+    logger.info("✓ Knowledge Base MCP Runtime cleanup done")
+
+
+def _artifact_share_mcp_runtime_name() -> str:
+    return f"artifact_share_of_{project_name}".replace("-", "_")
+
+
+def delete_artifact_share_mcp_runtime(cfg: Dict):
+    """Delete Artifact Share MCP AgentCore Runtime and its ECR repository."""
+    logger.info("  Deleting Artifact Share MCP Runtime")
+    runtime_names = [
+        _artifact_share_mcp_runtime_name(),
+        f"s3_sharing_of_{project_name}".replace("-", "_"),  # legacy
+    ]
+    arn = (
+        cfg.get("artifact_share_mcp_runtime_arn")
+        or cfg.get("s3_sharing_mcp_runtime_arn")
+        or ""
+    )
+
+    try:
+        next_token = None
+        runtime_ids: List[str] = []
+        while True:
+            kwargs = {}
+            if next_token:
+                kwargs["nextToken"] = next_token
+            response = agentcore_control_client.list_agent_runtimes(**kwargs)
+            for item in response.get("agentRuntimes", []):
+                name = item.get("agentRuntimeName")
+                if name in runtime_names or (
+                    arn and item.get("agentRuntimeArn") == arn
+                ):
+                    rid = item.get("agentRuntimeId")
+                    if rid and rid not in runtime_ids:
+                        runtime_ids.append(rid)
+            next_token = response.get("nextToken")
+            if not next_token:
+                break
+
+        for runtime_id in runtime_ids:
+            logger.info(f"  Deleting agent runtime: {runtime_id}")
+            try:
+                agentcore_control_client.delete_agent_runtime(agentRuntimeId=runtime_id)
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "ResourceNotFoundException":
+                    logger.warning(f"  Could not delete agent runtime: {e}")
+            deadline = time.time() + 300
+            while time.time() < deadline:
+                try:
+                    agentcore_control_client.get_agent_runtime(agentRuntimeId=runtime_id)
+                    time.sleep(5)
+                except ClientError as e:
+                    if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                        break
+                    raise
+            logger.info(f"  ✓ Deleted Artifact Share MCP Runtime: {runtime_id}")
+        if not runtime_ids:
+            logger.info("  No Artifact Share MCP Runtime found")
+    except Exception as e:
+        logger.warning(f"  Could not delete Artifact Share MCP Runtime: {e}")
+
+    repos = {
+        cfg.get("artifact_share_mcp_ecr_repository") or "",
+        cfg.get("s3_sharing_mcp_ecr_repository") or "",
+        _artifact_share_mcp_runtime_name(),
+        f"s3_sharing_of_{project_name}".replace("-", "_"),
+    }
+    ecr = boto3.client("ecr", region_name=region)
+    for repo in {r for r in repos if r}:
+        try:
+            ecr.delete_repository(repositoryName=repo, force=True)
+            logger.info(f"  ✓ Deleted ECR repository: {repo}")
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "RepositoryNotFoundException":
+                logger.info(f"  ECR repository not found: {repo}")
+            else:
+                logger.warning(f"  Could not delete ECR repository {repo}: {e}")
+    logger.info("✓ Artifact Share MCP Runtime cleanup done")
 
 
 def delete_knowledge_bases():
@@ -729,6 +1078,30 @@ INSTALLER_CONFIG_KEYS = [
     "knowledge_base_id",
     "data_source_id",
     "knowledge_base_role",
+    "knowledge_base_mcp_runtime_arn",
+    "knowledge_base_mcp_url",
+    "knowledge_base_mcp_role",
+    "knowledge_base_mcp_ecr_repository",
+    "knowledge_base_mcp_image_tag",
+    "knowledge_base_mcp_gateway_target_id",
+    "knowledge_base_mcp_gateway_arn",  # legacy
+    "knowledge_base_mcp_gateway_id",  # legacy
+    "knowledge_base_mcp_gateway_role",  # legacy
+    "artifact_share_mcp_runtime_arn",
+    "artifact_share_mcp_url",
+    "artifact_share_mcp_role",
+    "artifact_share_mcp_ecr_repository",
+    "artifact_share_mcp_image_tag",
+    "artifact_share_mcp_gateway_target_id",
+    "s3_sharing_mcp_runtime_arn",  # legacy
+    "s3_sharing_mcp_url",  # legacy
+    "s3_sharing_mcp_role",  # legacy
+    "s3_sharing_mcp_ecr_repository",  # legacy
+    "s3_sharing_mcp_image_tag",  # legacy
+    "s3_sharing_mcp_gateway_target_id",  # legacy
+    "agentcore_gateway_arn",
+    "agentcore_gateway_id",
+    "agentcore_gateway_role",
     "vector_bucket_name",
     "vector_bucket_arn",
     "vector_index_name",
@@ -829,8 +1202,12 @@ def main():
         else:
             logger.info("[2/8] No harness id found; skipping DeleteHarness")
 
+        delete_s3_files_session_storage(cfg)
         delete_vpc(cfg)
 
+        delete_agentcore_gateway(cfg)
+        delete_artifact_share_mcp_runtime(cfg)
+        delete_knowledge_base_mcp_runtime(cfg)
         delete_knowledge_bases()
         delete_s3_vectors_store()
 

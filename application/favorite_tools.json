@@ -1,7 +1,9 @@
 {
   "MCP": [
     "websearch",
-    "aws_documentation"
+    "aws_documentation",
+    "knowledge base",
+    "artifact-share"
   ],
   "SKILL": [
     "docx",
