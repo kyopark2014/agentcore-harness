@@ -3,7 +3,7 @@
 AWS Infrastructure Uninstaller for agentcore-harness.
 
 Deletes resources created by installer.py:
-  Harness, VPC/NAT, CloudFront, S3, IAM roles.
+  Harness, Knowledge Base, S3 Vectors, VPC/NAT, CloudFront, S3, IAM roles.
 """
 
 from __future__ import annotations
@@ -38,10 +38,15 @@ DELETE_POLL_INTERVAL_SEC = float(os.environ.get("AGENTCORE_DELETE_POLL_INTERVAL_
 sts_client = boto3.client("sts", region_name=region)
 account_id = str(sts_client.get_caller_identity()["Account"])
 
+vector_index_name = project_name
+vector_bucket_name = f"{project_name}-{account_id}"
+
 s3_client = boto3.client("s3", region_name=region)
 iam_client = boto3.client("iam", region_name=region)
 ec2_client = boto3.client("ec2", region_name=region)
+s3vectors_client = boto3.client("s3vectors", region_name=region)
 cloudfront_client = boto3.client("cloudfront", region_name=region)
+bedrock_agent_client = boto3.client("bedrock-agent", region_name=region)
 agentcore_control_client = boto3.client(
     "bedrock-agentcore-control",
     region_name=region,
@@ -78,8 +83,9 @@ def _vpc_name() -> str:
 
 def load_config() -> Dict:
     global project_name, region, account_id
-    global s3_client, iam_client, ec2_client
-    global cloudfront_client, agentcore_control_client
+    global vector_index_name, vector_bucket_name
+    global s3_client, iam_client, ec2_client, s3vectors_client
+    global cloudfront_client, bedrock_agent_client, agentcore_control_client
 
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -96,10 +102,15 @@ def load_config() -> Dict:
     else:
         account_id = str(sts_client.get_caller_identity()["Account"])
 
+    vector_index_name = project_name
+    vector_bucket_name = f"{project_name}-{account_id}"
+
     s3_client = boto3.client("s3", region_name=region)
     iam_client = boto3.client("iam", region_name=region)
     ec2_client = boto3.client("ec2", region_name=region)
+    s3vectors_client = boto3.client("s3vectors", region_name=region)
     cloudfront_client = boto3.client("cloudfront", region_name=region)
+    bedrock_agent_client = boto3.client("bedrock-agent", region_name=region)
     agentcore_control_client = boto3.client(
         "bedrock-agentcore-control",
         region_name=region,
@@ -562,11 +573,140 @@ def delete_iam_role(role_name: str):
 def delete_iam_roles():
     logger.info("  Deleting IAM roles")
     harness_role = f"role-harness-for-{project_name}-{region}"
+    kb_role = f"role-knowledge-base-for-{project_name}-{region}"
     delete_iam_role(harness_role)
+    delete_iam_role(kb_role)
     # Best-effort cleanup of legacy roles from older installer versions
     delete_iam_role(f"role-agentcore-memory-for-{project_name}-{region}")
     delete_iam_role(f"role-s3files-sync-for-{project_name}")
     logger.info("✓ IAM roles processed")
+
+
+def delete_knowledge_bases():
+    """Delete Knowledge Bases and their data sources."""
+    logger.info("  Deleting Knowledge Bases")
+
+    try:
+        kb_list = bedrock_agent_client.list_knowledge_bases()
+        knowledge_bases = kb_list.get("knowledgeBaseSummaries", [])
+
+        kb_to_delete = []
+        for kb in knowledge_bases:
+            if kb["name"] == project_name:
+                kb_to_delete.append(kb["knowledgeBaseId"])
+                logger.info(f"  Knowledge Base found: {kb['knowledgeBaseId']}")
+
+        if not kb_to_delete:
+            logger.info(f"  No Knowledge Base found with name: {project_name}")
+            return
+
+        for kb_id in kb_to_delete:
+            try:
+                logger.info(f"  Deleting Knowledge Base: {kb_id}")
+
+                try:
+                    data_sources = bedrock_agent_client.list_data_sources(
+                        knowledgeBaseId=kb_id,
+                        maxResults=100,
+                    )
+                    for ds in data_sources.get("dataSourceSummaries", []):
+                        try:
+                            bedrock_agent_client.delete_data_source(
+                                knowledgeBaseId=kb_id,
+                                dataSourceId=ds["dataSourceId"],
+                            )
+                            logger.info(f"    ✓ Deleted data source: {ds['dataSourceId']}")
+                        except Exception as e:
+                            logger.warning(
+                                f"    Could not delete data source {ds['dataSourceId']}: {e}"
+                            )
+                except Exception as e:
+                    logger.debug(f"    Error listing/deleting data sources: {e}")
+
+                bedrock_agent_client.delete_knowledge_base(knowledgeBaseId=kb_id)
+                logger.info(f"  ✓ Deleted Knowledge Base: {kb_id}")
+
+                max_wait = 60
+                waited = 0
+                while waited < max_wait:
+                    try:
+                        kb_response = bedrock_agent_client.get_knowledge_base(
+                            knowledgeBaseId=kb_id
+                        )
+                        status = kb_response["knowledgeBase"]["status"]
+                        if status == "DELETED":
+                            break
+                        time.sleep(5)
+                        waited += 5
+                    except ClientError as e:
+                        if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                            break
+                        raise
+
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                    logger.debug(f"  Knowledge Base {kb_id} already deleted")
+                else:
+                    logger.warning(f"  Could not delete Knowledge Base {kb_id}: {e}")
+            except Exception as e:
+                logger.warning(f"  Error deleting Knowledge Base {kb_id}: {e}")
+
+        logger.info("✓ Knowledge Bases deleted")
+    except Exception as e:
+        logger.warning(f"  Could not list/delete Knowledge Bases: {e}")
+
+
+def delete_s3_vectors_store():
+    """Delete S3 Vectors index and vector bucket created by installer.py."""
+    logger.info("  Deleting S3 Vectors store")
+
+    def _delete_vector_index() -> bool:
+        max_wait = 120
+        waited = 0
+        while waited <= max_wait:
+            try:
+                s3vectors_client.delete_index(
+                    vectorBucketName=vector_bucket_name,
+                    indexName=vector_index_name,
+                )
+                logger.info(f"  ✓ Deleted vector index: {vector_index_name}")
+                return True
+            except ClientError as e:
+                code = e.response["Error"]["Code"]
+                if code == "NotFoundException":
+                    logger.info(f"  Vector index not found: {vector_index_name}")
+                    return True
+                if code == "ConflictException" and waited < max_wait:
+                    logger.info(
+                        "  Vector index still in use; waiting for Knowledge Base cleanup..."
+                    )
+                    time.sleep(10)
+                    waited += 10
+                    continue
+                logger.warning(f"  Could not delete vector index {vector_index_name}: {e}")
+                return False
+        return False
+
+    try:
+        _delete_vector_index()
+
+        try:
+            s3vectors_client.delete_vector_bucket(
+                vectorBucketName=vector_bucket_name,
+            )
+            logger.info(f"  ✓ Deleted vector bucket: {vector_bucket_name}")
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code == "NotFoundException":
+                logger.info(f"  Vector bucket not found: {vector_bucket_name}")
+            else:
+                logger.warning(
+                    f"  Could not delete vector bucket {vector_bucket_name}: {e}"
+                )
+
+        logger.info("✓ S3 Vectors store deleted")
+    except Exception as e:
+        logger.error(f"Error deleting S3 Vectors store: {e}")
 
 
 INSTALLER_CONFIG_KEYS = [
@@ -586,6 +726,13 @@ INSTALLER_CONFIG_KEYS = [
     "s3_files_mount_path",
     "agent_runtime_vpc_subnets",
     "agent_runtime_security_groups",
+    "knowledge_base_id",
+    "data_source_id",
+    "knowledge_base_role",
+    "vector_bucket_name",
+    "vector_bucket_arn",
+    "vector_index_name",
+    "vector_index_arn",
 ]
 
 
@@ -683,6 +830,9 @@ def main():
             logger.info("[2/8] No harness id found; skipping DeleteHarness")
 
         delete_vpc(cfg)
+
+        delete_knowledge_bases()
+        delete_s3_vectors_store()
 
         delete_iam_roles()
 

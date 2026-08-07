@@ -2,7 +2,7 @@
 """
 AWS Infrastructure Installer using boto3
 This script provisions AgentCore Harness (S3, skills, VPC, CloudFront,
-IAM roles, CreateHarness) for local development.
+IAM roles, S3 Vectors Knowledge Base, CreateHarness) for local development.
 """
 
 import boto3
@@ -14,7 +14,7 @@ import re
 import sys
 import mimetypes
 import uuid
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from botocore.exceptions import ClientError
 
 # Configuration
@@ -34,9 +34,22 @@ _HARNESS_NAME_API_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{0,39}$")
 sts_client = boto3.client("sts", region_name=region)
 account_id = str(sts_client.get_caller_identity()["Account"])
 
+# Bedrock Knowledge Base + S3 Vectors (same pattern as power-runtime)
+vector_index_name = project_name
+vector_bucket_name = f"{project_name}-{account_id}"
+embedding_dimensions = 1024
+embedding_data_type = "float32"
+distance_metric = "cosine"
+# Bedrock Knowledge Base requires these metadata keys as non-filterable on S3 Vectors index
+BEDROCK_NON_FILTERABLE_METADATA_KEYS = [
+    "AMAZON_BEDROCK_TEXT",
+    "AMAZON_BEDROCK_METADATA",
+]
+
 iam_client = boto3.client("iam", region_name=region)
 s3_client = boto3.client("s3", region_name=region)
 ec2_client = boto3.client("ec2", region_name=region)
+s3vectors_client = boto3.client("s3vectors", region_name=region)
 cloudfront_client = boto3.client("cloudfront", region_name=region)
 agentcore_control_client = boto3.client(
     "bedrock-agentcore-control",
@@ -47,6 +60,21 @@ WORKING_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(WORKING_DIR, "application", "config.json")
 SKILLS_DIR = os.path.join(WORKING_DIR, "skills")
 SKILLS_S3_PREFIX = "skills"
+
+
+def s3_vectors_bucket_arn(bucket_name: Optional[str] = None) -> str:
+    """ARN for an S3 vector bucket."""
+    name = bucket_name or vector_bucket_name
+    return f"arn:aws:s3vectors:{region}:{account_id}:bucket/{name}"
+
+
+def s3_vectors_index_arn(
+    index_name: Optional[str] = None,
+    bucket_name: Optional[str] = None,
+) -> str:
+    """ARN for a vector index within an S3 vector bucket."""
+    idx = index_name or vector_index_name
+    return f"{s3_vectors_bucket_arn(bucket_name)}/index/{idx}"
 
 
 def _bucket_name() -> str:
@@ -203,7 +231,9 @@ def attach_inline_policy(role_name: str, policy_name: str, policy_document: Dict
 def load_config(config_path: str) -> Dict:
     """Load application config, creating defaults when missing."""
     global project_name, region, account_id
+    global vector_index_name, vector_bucket_name
     global agentcore_control_client, s3_client, cloudfront_client, ec2_client
+    global s3vectors_client
 
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -232,14 +262,492 @@ def load_config(config_path: str) -> Dict:
     config["region"] = region
     config["accountId"] = account_id
 
+    vector_index_name = project_name
+    vector_bucket_name = f"{project_name}-{account_id}"
+
     agentcore_control_client = boto3.client(
         "bedrock-agentcore-control",
         region_name=region,
     )
     s3_client = boto3.client("s3", region_name=region)
     ec2_client = boto3.client("ec2", region_name=region)
+    s3vectors_client = boto3.client("s3vectors", region_name=region)
     cloudfront_client = boto3.client("cloudfront", region_name=region)
     return config
+
+
+def _bedrock_knowledge_base_trust_policy() -> Dict:
+    """Trust policy for Bedrock Knowledge Base service role (AWS recommended)."""
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "bedrock.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                    "StringEquals": {"aws:SourceAccount": account_id},
+                    "ArnLike": {
+                        "aws:SourceArn": (
+                            f"arn:aws:bedrock:{region}:{account_id}:knowledge-base/*"
+                        )
+                    },
+                },
+            }
+        ],
+    }
+
+
+def wait_for_iam_role_propagation(role_name: str, wait_seconds: int = 15) -> None:
+    """Wait for IAM role and inline policies to propagate."""
+    logger.info(f"  Waiting {wait_seconds}s for IAM role propagation: {role_name}")
+    time.sleep(wait_seconds)
+
+    expected_policies = {
+        f"kb-bedrock-policy-for-{project_name}",
+        f"kb-s3-policy-for-{project_name}",
+        f"kb-opensearch-policy-for-{project_name}",
+        f"kb-s3vectors-policy-for-{project_name}",
+    }
+    for attempt in range(3):
+        try:
+            attached = iam_client.list_role_policies(RoleName=role_name)
+            missing = expected_policies - set(attached.get("PolicyNames", []))
+            if not missing:
+                logger.info("  ✓ Knowledge Base role inline policies are attached")
+                return
+            logger.debug(
+                f"  Waiting for inline policies (attempt {attempt + 1}/3): {sorted(missing)}"
+            )
+        except ClientError as e:
+            logger.debug(f"  Could not list role policies yet: {e}")
+        time.sleep(5)
+
+    logger.warning(
+        "  Some Knowledge Base role inline policies may not be visible yet; continuing"
+    )
+
+
+def _project_s3_bucket_arns() -> Tuple[str, str]:
+    """Return (bucket ARN, object ARN) for the project storage bucket."""
+    bucket_arn = f"arn:aws:s3:::{_bucket_name()}"
+    return bucket_arn, f"{bucket_arn}/*"
+
+
+def create_knowledge_base_role() -> str:
+    """Create Knowledge Base IAM role with least-privilege policies."""
+    logger.info("[3/11] Creating Knowledge Base IAM role")
+    role_name = f"role-knowledge-base-for-{project_name}-{region}"
+
+    assume_role_policy = _bedrock_knowledge_base_trust_policy()
+    role_arn, role_created = create_iam_role(
+        role_name,
+        assume_role_policy,
+        description="Bedrock Knowledge Base service role",
+    )
+    bucket_arn, object_arn = _project_s3_bucket_arns()
+
+    bedrock_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "InvokeEmbeddingModels",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock:InvokeModel",
+                    "bedrock:InvokeModelWithResponseStream",
+                    "bedrock:GetInferenceProfile",
+                    "bedrock:GetFoundationModel",
+                ],
+                "Resource": [
+                    "arn:aws:bedrock:*::foundation-model/*",
+                    f"arn:aws:bedrock:{region}:{account_id}:inference-profile/*",
+                    f"arn:aws:bedrock:{region}:*:inference-profile/*",
+                ],
+            }
+        ],
+    }
+    attach_inline_policy(role_name, f"kb-bedrock-policy-for-{project_name}", bedrock_policy)
+
+    s3_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "ListKnowledgeBaseBucket",
+                "Effect": "Allow",
+                "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+                "Resource": [bucket_arn],
+            },
+            {
+                "Sid": "ReadKnowledgeBaseObjects",
+                "Effect": "Allow",
+                "Action": ["s3:GetObject"],
+                "Resource": [object_arn],
+            },
+        ],
+    }
+    attach_inline_policy(role_name, f"kb-s3-policy-for-{project_name}", s3_policy)
+
+    opensearch_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "OpenSearchServerlessAccess",
+                "Effect": "Allow",
+                "Action": ["aoss:APIAccessAll"],
+                "Resource": [f"arn:aws:aoss:{region}:{account_id}:collection/*"],
+            }
+        ],
+    }
+    attach_inline_policy(role_name, f"kb-opensearch-policy-for-{project_name}", opensearch_policy)
+
+    vector_arn = s3_vectors_bucket_arn()
+    s3vectors_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "S3VectorsAccess",
+                "Effect": "Allow",
+                "Action": [
+                    "s3vectors:GetVectorBucket",
+                    "s3vectors:ListVectorBuckets",
+                    "s3vectors:GetIndex",
+                    "s3vectors:ListIndexes",
+                    "s3vectors:QueryVectors",
+                    "s3vectors:GetVectors",
+                    "s3vectors:PutVectors",
+                    "s3vectors:DeleteVectors",
+                    "s3vectors:ListVectors",
+                ],
+                "Resource": [
+                    vector_arn,
+                    f"{vector_arn}/index/*",
+                ],
+            }
+        ],
+    }
+    attach_inline_policy(
+        role_name, f"kb-s3vectors-policy-for-{project_name}", s3vectors_policy
+    )
+
+    if role_created:
+        wait_for_iam_role_propagation(role_name)
+    else:
+        logger.info(f"  Skipping IAM wait (KB role already exists: {role_name})")
+    logger.info(f"✓ Knowledge Base role ready: {role_arn}")
+    return role_arn
+
+
+def check_knowledge_base_exists() -> Optional[str]:
+    """Check if Knowledge Base exists and return its ID if found."""
+    bedrock_agent_client = boto3.client("bedrock-agent", region_name=region)
+
+    try:
+        kb_list = bedrock_agent_client.list_knowledge_bases()
+        for kb in kb_list.get("knowledgeBaseSummaries", []):
+            if kb["name"] == project_name:
+                logger.debug(f"Knowledge Base found: {kb['knowledgeBaseId']}")
+                return kb["knowledgeBaseId"]
+        return None
+    except Exception as e:
+        logger.debug(f"Error checking Knowledge Base existence: {e}")
+        return None
+
+
+def delete_knowledge_base(knowledge_base_id: str) -> None:
+    """Delete Knowledge Base and its data sources."""
+    bedrock_agent_client = boto3.client("bedrock-agent", region_name=region)
+
+    try:
+        try:
+            data_sources = bedrock_agent_client.list_data_sources(
+                knowledgeBaseId=knowledge_base_id,
+                maxResults=100,
+            )
+            for ds in data_sources.get("dataSourceSummaries", []):
+                try:
+                    bedrock_agent_client.delete_data_source(
+                        knowledgeBaseId=knowledge_base_id,
+                        dataSourceId=ds["dataSourceId"],
+                    )
+                    logger.debug(f"Deleted data source: {ds['dataSourceId']}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete data source {ds['dataSourceId']}: {e}")
+        except Exception as e:
+            logger.debug(f"Error listing/deleting data sources: {e}")
+
+        bedrock_agent_client.delete_knowledge_base(knowledgeBaseId=knowledge_base_id)
+        logger.info(f"Deleted Knowledge Base: {knowledge_base_id}")
+
+        logger.debug("Waiting for Knowledge Base deletion to complete...")
+        max_wait = 60
+        waited = 0
+        while waited < max_wait:
+            try:
+                kb_response = bedrock_agent_client.get_knowledge_base(
+                    knowledgeBaseId=knowledge_base_id
+                )
+                status = kb_response["knowledgeBase"]["status"]
+                if status == "DELETED":
+                    break
+                time.sleep(5)
+                waited += 5
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                    logger.debug("Knowledge Base deletion confirmed")
+                    break
+                raise
+
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceNotFoundException":
+            logger.debug(f"Knowledge Base {knowledge_base_id} already deleted")
+        else:
+            logger.error(f"Failed to delete Knowledge Base {knowledge_base_id}: {e}")
+            raise
+
+
+def create_s3_vectors_store() -> Dict[str, str]:
+    """Create S3 vector bucket and index for Bedrock Knowledge Base."""
+    logger.info("[4/11] Creating S3 Vectors store (vector bucket + index)")
+
+    vector_bucket_arn = s3_vectors_bucket_arn()
+    index_arn = s3_vectors_index_arn()
+
+    try:
+        s3vectors_client.create_vector_bucket(vectorBucketName=vector_bucket_name)
+        logger.info(f"  ✓ Vector bucket created: {vector_bucket_name}")
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code in ("ConflictException", "ResourceAlreadyExistsException"):
+            logger.warning(f"  Vector bucket already exists: {vector_bucket_name}")
+            try:
+                existing = s3vectors_client.get_vector_bucket(
+                    vectorBucketName=vector_bucket_name
+                )
+                vector_bucket_arn = existing["vectorBucket"]["vectorBucketArn"]
+            except ClientError:
+                pass
+        else:
+            logger.error(f"Failed to create vector bucket: {e}")
+            raise
+
+    try:
+        response = s3vectors_client.create_index(
+            vectorBucketName=vector_bucket_name,
+            indexName=vector_index_name,
+            dataType=embedding_data_type,
+            dimension=embedding_dimensions,
+            distanceMetric=distance_metric,
+            metadataConfiguration={
+                "nonFilterableMetadataKeys": BEDROCK_NON_FILTERABLE_METADATA_KEYS,
+            },
+        )
+        index_arn = response.get("indexArn", index_arn)
+        logger.info(f"  ✓ Vector index created: {vector_index_name}")
+        logger.info("  Waiting for vector index to be ready...")
+        time.sleep(15)
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code in ("ConflictException", "ResourceAlreadyExistsException"):
+            logger.warning(f"  Vector index already exists: {vector_index_name}")
+            try:
+                existing = s3vectors_client.get_index(
+                    vectorBucketName=vector_bucket_name,
+                    indexName=vector_index_name,
+                )
+                index_arn = existing["index"]["indexArn"]
+            except ClientError:
+                pass
+        else:
+            logger.error(f"Failed to create vector index: {e}")
+            raise
+
+    logger.info("✓ S3 Vectors store ready")
+    logger.info(f"  Vector bucket ARN: {vector_bucket_arn}")
+    logger.info(f"  Vector index ARN: {index_arn}")
+
+    return {
+        "vectorBucketName": vector_bucket_name,
+        "vectorBucketArn": vector_bucket_arn,
+        "indexName": vector_index_name,
+        "indexArn": index_arn,
+    }
+
+
+def ensure_data_source(
+    bedrock_agent_client,
+    knowledge_base_id: str,
+    s3_bucket_name: str,
+) -> str:
+    """Create S3 data source with default parser when missing."""
+    data_sources = bedrock_agent_client.list_data_sources(
+        knowledgeBaseId=knowledge_base_id,
+        maxResults=100,
+    )
+    for ds in data_sources.get("dataSourceSummaries", []):
+        if ds["name"] == s3_bucket_name:
+            logger.info(f"  Data source already exists: {ds['dataSourceId']}")
+            return ds["dataSourceId"]
+
+    logger.info("  Creating data source with default parser...")
+    data_source_response = bedrock_agent_client.create_data_source(
+        knowledgeBaseId=knowledge_base_id,
+        name=s3_bucket_name,
+        description=f"S3 data source: {s3_bucket_name}",
+        dataDeletionPolicy="RETAIN",
+        dataSourceConfiguration={
+            "type": "S3",
+            "s3Configuration": {
+                "bucketArn": f"arn:aws:s3:::{s3_bucket_name}",
+                "inclusionPrefixes": ["docs/"],
+            },
+        },
+        vectorIngestionConfiguration={
+            "chunkingConfiguration": {
+                "chunkingStrategy": "FIXED_SIZE",
+                "fixedSizeChunkingConfiguration": {
+                    "maxTokens": 300,
+                    "overlapPercentage": 20,
+                },
+            },
+        },
+    )
+    data_source_id = data_source_response["dataSource"]["dataSourceId"]
+    logger.info(f"  ✓ Data source created: {data_source_id}")
+    return data_source_id
+
+
+def create_knowledge_base_with_s3_vectors(
+    s3_vectors_info: Dict[str, str], knowledge_base_role_arn: str, s3_bucket_name: str
+) -> Tuple[str, str]:
+    """Create Knowledge Base with S3 Vectors as the vector store."""
+    logger.info("[4.5/11] Creating Knowledge Base with S3 Vectors")
+
+    bedrock_agent_client = boto3.client("bedrock-agent", region_name=region)
+
+    try:
+        logger.info("  Checking if Knowledge Base already exists...")
+        kb_list = bedrock_agent_client.list_knowledge_bases()
+        for kb in kb_list.get("knowledgeBaseSummaries", []):
+            if kb["name"] == project_name:
+                logger.warning(f"Knowledge Base already exists: {kb['knowledgeBaseId']}")
+
+                kb_details = bedrock_agent_client.get_knowledge_base(
+                    knowledgeBaseId=kb["knowledgeBaseId"]
+                )
+                storage = kb_details["knowledgeBase"]["storageConfiguration"]
+                s3_cfg = storage.get("s3VectorsConfiguration", {})
+                kb_index_arn = s3_cfg.get("indexArn")
+                storage_type = storage.get("type")
+
+                if storage_type != "S3_VECTORS" or kb_index_arn != s3_vectors_info["indexArn"]:
+                    logger.warning("Knowledge Base is not using the expected S3 Vectors index:")
+                    logger.warning(f"  Storage type: {storage_type}")
+                    logger.warning(f"  Current index ARN: {kb_index_arn}")
+                    logger.warning(f"  Expected index ARN: {s3_vectors_info['indexArn']}")
+
+                    delete_knowledge_base(kb["knowledgeBaseId"])
+                    break
+
+                logger.info("Knowledge Base is using correct S3 Vectors index")
+                data_source_id = ensure_data_source(
+                    bedrock_agent_client, kb["knowledgeBaseId"], s3_bucket_name
+                )
+                return kb["knowledgeBaseId"], data_source_id
+        logger.info("  Knowledge Base does not exist. Creating new one...")
+    except Exception as e:
+        logger.debug(f"Error checking existing Knowledge Base: {e}")
+
+    logger.info("  Verifying Knowledge Base role configuration...")
+    try:
+        role_response = iam_client.get_role(
+            RoleName=f"role-knowledge-base-for-{project_name}-{region}"
+        )
+        policy_doc = role_response["Role"]["AssumeRolePolicyDocument"]
+        if isinstance(policy_doc, str):
+            trust_policy = json.loads(policy_doc)
+        else:
+            trust_policy = policy_doc
+        logger.debug(f"  Role trust policy: {json.dumps(trust_policy, indent=2)}")
+
+        statements = trust_policy.get("Statement", [])
+        bedrock_allowed = False
+        for statement in statements:
+            if statement.get("Effect") == "Allow":
+                principal = statement.get("Principal", {})
+                if principal.get("Service") == "bedrock.amazonaws.com":
+                    bedrock_allowed = True
+                    break
+
+        if not bedrock_allowed:
+            logger.error(
+                "  ✗ Knowledge Base role trust policy does not allow bedrock.amazonaws.com"
+            )
+            logger.error(
+                "  Please update the role trust policy manually or delete and recreate the role"
+            )
+            raise Exception("Knowledge Base role trust policy is incorrect")
+
+        logger.info("  ✓ Knowledge Base role trust policy is correct")
+    except ClientError as role_error:
+        logger.error(f"  ✗ Failed to verify Knowledge Base role: {role_error}")
+        raise
+
+    logger.debug(
+        f"Creating Knowledge Base with S3 Vectors index: {s3_vectors_info['indexArn']}"
+    )
+    response = bedrock_agent_client.create_knowledge_base(
+        name=project_name,
+        description="Knowledge base with default parser (S3 Vectors)",
+        roleArn=knowledge_base_role_arn,
+        tags={project_name: "true"},
+        knowledgeBaseConfiguration={
+            "type": "VECTOR",
+            "vectorKnowledgeBaseConfiguration": {
+                "embeddingModelArn": (
+                    f"arn:aws:bedrock:{region}::foundation-model/"
+                    "amazon.titan-embed-text-v2:0"
+                ),
+                "embeddingModelConfiguration": {
+                    "bedrockEmbeddingModelConfiguration": {
+                        "dimensions": embedding_dimensions,
+                        "embeddingDataType": "FLOAT32",
+                    }
+                },
+            },
+        },
+        storageConfiguration={
+            "type": "S3_VECTORS",
+            "s3VectorsConfiguration": {
+                "vectorBucketArn": s3_vectors_info["vectorBucketArn"],
+                "indexArn": s3_vectors_info["indexArn"],
+            },
+        },
+    )
+
+    knowledge_base_id = response["knowledgeBase"]["knowledgeBaseId"]
+    logger.info(f"✓ Knowledge Base created: {knowledge_base_id}")
+
+    logger.info("  Waiting for Knowledge Base to be active...")
+    while True:
+        kb_response = bedrock_agent_client.get_knowledge_base(
+            knowledgeBaseId=knowledge_base_id
+        )
+        status = kb_response["knowledgeBase"]["status"]
+
+        if status == "ACTIVE":
+            logger.info("  Knowledge Base is now active")
+            break
+        if status == "FAILED":
+            raise Exception("Knowledge Base creation failed")
+
+        logger.debug(f"  Knowledge Base status: {status} (waiting...)")
+        time.sleep(10)
+
+    data_source_id = ensure_data_source(
+        bedrock_agent_client, knowledge_base_id, s3_bucket_name
+    )
+    return knowledge_base_id, data_source_id
 
 
 def _vpc_name() -> str:
@@ -903,6 +1411,20 @@ def create_harness_execution_role() -> str:
                 ],
             },
             {
+                "Sid": "KnowledgeBaseRetrieve",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock:Retrieve",
+                    "bedrock:RetrieveAndGenerate",
+                    "bedrock:StartIngestionJob",
+                    "bedrock:GetIngestionJob",
+                    "bedrock:ListIngestionJobs",
+                ],
+                "Resource": [
+                    f"arn:aws:bedrock:{region}:{account_id}:knowledge-base/*",
+                ],
+            },
+            {
                 "Sid": "AgentCoreAccess",
                 "Effect": "Allow",
                 "Action": ["bedrock-agentcore:*"],
@@ -1038,9 +1560,56 @@ def wait_for_harness_ready(harness_id: str, timeout_seconds: int = 300) -> str:
     raise TimeoutError(f"Harness {harness_id} did not reach READY within {timeout_seconds}s")
 
 
+def _harness_environment_variables(
+    *,
+    s3_bucket_name: Optional[str] = None,
+    knowledge_base_id: Optional[str] = None,
+    data_source_id: Optional[str] = None,
+) -> Dict[str, str]:
+    """Env vars for Harness runtime (S3 bucket + Knowledge Base)."""
+    env: Dict[str, str] = {"LOG_LEVEL": "info"}
+    bucket = s3_bucket_name or _bucket_name()
+    if bucket:
+        env["S3_BUCKET"] = bucket
+    if knowledge_base_id:
+        env["KNOWLEDGE_BASE_ID"] = knowledge_base_id
+    if data_source_id:
+        env["DATA_SOURCE_ID"] = data_source_id
+    return env
+
+
+def ensure_harness_kb_env(
+    harness_id: str,
+    s3_bucket_name: str,
+    knowledge_base_id: Optional[str] = None,
+    data_source_id: Optional[str] = None,
+) -> None:
+    """Inject S3_BUCKET / KNOWLEDGE_BASE_ID / DATA_SOURCE_ID into harness env."""
+    if not harness_id:
+        return
+    env_vars = _harness_environment_variables(
+        s3_bucket_name=s3_bucket_name,
+        knowledge_base_id=knowledge_base_id,
+        data_source_id=data_source_id,
+    )
+    logger.info(
+        "  Updating harness environmentVariables: "
+        f"S3_BUCKET={s3_bucket_name or '(none)'}, "
+        f"KNOWLEDGE_BASE_ID={knowledge_base_id or '(none)'}, "
+        f"DATA_SOURCE_ID={data_source_id or '(none)'}"
+    )
+    agentcore_control_client.update_harness(
+        harnessId=harness_id,
+        environmentVariables=env_vars,
+    )
+
+
 def ensure_harness_environment(
     harness_id: str,
     environment: Dict,
+    *,
+    knowledge_base_id: Optional[str] = None,
+    data_source_id: Optional[str] = None,
 ) -> None:
     """Update harness environment when VPC network config differs from desired."""
     h = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
@@ -1075,13 +1644,19 @@ def ensure_harness_environment(
     agentcore_control_client.update_harness(
         harnessId=harness_id,
         environment=desired,
-        environmentVariables={"LOG_LEVEL": "info"},
+        environmentVariables=_harness_environment_variables(
+            knowledge_base_id=knowledge_base_id,
+            data_source_id=data_source_id,
+        ),
     )
 
 
 def create_or_get_harness(
     execution_role_arn: str,
     vpc_runtime: Optional[Dict[str, object]] = None,
+    *,
+    knowledge_base_id: Optional[str] = None,
+    data_source_id: Optional[str] = None,
 ) -> Dict[str, str]:
     """Create AgentCore Harness or reuse an existing one by API name."""
     logger.info("[5/6] Creating AgentCore Harness")
@@ -1092,6 +1667,10 @@ def create_or_get_harness(
     model_id = DEFAULT_MODEL_ID
     system_prompt = [{"text": BASE_SYSTEM_PROMPT}]
     environment = build_harness_runtime_environment(vpc_runtime)
+    env_vars = _harness_environment_variables(
+        knowledge_base_id=knowledge_base_id,
+        data_source_id=data_source_id,
+    )
 
     existing = find_harness_by_api_name(harness_api_name)
     if existing:
@@ -1190,7 +1769,7 @@ def create_or_get_harness(
                 maxTokens=50000,
                 timeoutSeconds=300,
                 environment=environment,
-                environmentVariables={"LOG_LEVEL": "info"},
+                environmentVariables=env_vars,
                 tags={"Project": project_name, "Env": "dev"},
             )
             harness_id = response["harness"]["harnessId"]
@@ -1211,7 +1790,12 @@ def create_or_get_harness(
                 f"({harness_api_name!r})."
             )
 
-    ensure_harness_environment(harness_id, environment)
+    ensure_harness_environment(
+        harness_id,
+        environment,
+        knowledge_base_id=knowledge_base_id,
+        data_source_id=data_source_id,
+    )
     harness_arn = wait_for_harness_ready(harness_id)
 
     return {
@@ -1254,6 +1838,10 @@ def build_config_from_deployment_state(
     cloudfront_info: Optional[Dict[str, str]] = None,
     vpc_info: Optional[Dict[str, object]] = None,
     vpc_runtime: Optional[Dict[str, object]] = None,
+    knowledge_base_id: Optional[str] = None,
+    data_source_id: Optional[str] = None,
+    knowledge_base_role_arn: Optional[str] = None,
+    s3_vectors_info: Optional[Dict[str, str]] = None,
 ) -> Dict:
     config_data: Dict = {
         "projectName": project_name,
@@ -1279,6 +1867,17 @@ def build_config_from_deployment_state(
         config_data["agent_runtime_security_groups"] = vpc_runtime.get(
             "security_groups", []
         )
+    if knowledge_base_id:
+        config_data["knowledge_base_id"] = knowledge_base_id
+    if data_source_id:
+        config_data["data_source_id"] = data_source_id
+    if knowledge_base_role_arn:
+        config_data["knowledge_base_role"] = knowledge_base_role_arn
+    if s3_vectors_info:
+        config_data["vector_bucket_name"] = s3_vectors_info.get("vectorBucketName", "")
+        config_data["vector_bucket_arn"] = s3_vectors_info.get("vectorBucketArn", "")
+        config_data["vector_index_name"] = s3_vectors_info.get("indexName", "")
+        config_data["vector_index_arn"] = s3_vectors_info.get("indexArn", "")
     # Remove legacy Memory / S3 Files keys on write
     for legacy in (
         "agentcore_memory_role",
@@ -1306,11 +1905,16 @@ def main():
     logger.info(f"Region: {region}")
     logger.info(f"Account ID: {account_id}")
     logger.info(f"Bucket Name: {_bucket_name()}")
+    logger.info(f"Vector Bucket: {vector_bucket_name}")
     logger.info(f"Config: {CONFIG_PATH}")
     logger.info("=" * 60)
 
     start_time = time.time()
     s3_bucket_name = None
+    knowledge_base_role_arn = None
+    s3_vectors_info = None
+    knowledge_base_id = None
+    data_source_id = None
     execution_role_arn = None
     vpc_info = None
     vpc_runtime = None
@@ -1321,6 +1925,13 @@ def main():
     try:
         s3_bucket_name = create_s3_bucket()
         upload_skills_to_s3(s3_bucket_name)
+
+        knowledge_base_role_arn = create_knowledge_base_role()
+        s3_vectors_info = create_s3_vectors_store()
+        knowledge_base_id, data_source_id = create_knowledge_base_with_s3_vectors(
+            s3_vectors_info, knowledge_base_role_arn, s3_bucket_name
+        )
+
         execution_role_arn = create_harness_execution_role()
 
         logger.info("[4/6] Ensuring VPC for Harness")
@@ -1331,8 +1942,16 @@ def main():
         harness_info = create_or_get_harness(
             execution_role_arn,
             vpc_runtime=vpc_runtime,
+            knowledge_base_id=knowledge_base_id,
+            data_source_id=data_source_id,
         )
         cloudfront_info = create_cloudfront_distribution(s3_bucket_name)
+        ensure_harness_kb_env(
+            harness_info["harness_id"],
+            s3_bucket_name,
+            knowledge_base_id=knowledge_base_id,
+            data_source_id=data_source_id,
+        )
         deployment_success = True
 
         elapsed_time = time.time() - start_time
@@ -1342,6 +1961,11 @@ def main():
         logger.info("=" * 60)
         logger.info(f"  S3 Bucket: {s3_bucket_name}")
         logger.info(f"  CloudFront Domain: https://{cloudfront_info['domain']}")
+        logger.info(f"  Knowledge Base ID: {knowledge_base_id}")
+        logger.info(f"  Data Source ID: {data_source_id}")
+        logger.info(f"  Knowledge Base Role: {knowledge_base_role_arn}")
+        logger.info(f"  Vector Bucket: {s3_vectors_info.get('vectorBucketName')}")
+        logger.info(f"  Vector Index: {s3_vectors_info.get('indexName')}")
         logger.info(f"  VPC: {vpc_info.get('vpc_id')}")
         logger.info(f"  Subnets: {vpc_runtime.get('subnets')}")
         logger.info(f"  Security groups: {vpc_runtime.get('security_groups')}")
@@ -1365,6 +1989,10 @@ def main():
             cloudfront_info=cloudfront_info,
             vpc_info=vpc_info,
             vpc_runtime=vpc_runtime,
+            knowledge_base_id=knowledge_base_id,
+            data_source_id=data_source_id,
+            knowledge_base_role_arn=knowledge_base_role_arn,
+            s3_vectors_info=s3_vectors_info,
         )
         if write_config(CONFIG_PATH, config_data):
             if deployment_success:
