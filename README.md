@@ -4,7 +4,7 @@ AgentCore의 관리형 에이전트 하네스(Managed Agent Harness)는 사전 �
 
 이 저장소는 **인프라 프로비저닝(`installer.py`)** 과 **Streamlit UI(`application/`)** 로 구성됩니다. Harness는 **VPC 모드 + Amazon S3 Files** 마운트로 세션 스토리지를 붙이고, UI에서 고른 Skill·MCP·모델을 `InvokeHarness` 호출마다 override합니다.
 
-<img width="943" height="491" alt="image" src="https://github.com/user-attachments/assets/2e2ae8be-ca33-4297-b949-51de432dc26e" />
+<img width="900" alt="image" src="https://github.com/user-attachments/assets/ea7bbf66-eec1-4b4c-bae8-e5f74291c859" />
 
 ## 주요 특징
 
