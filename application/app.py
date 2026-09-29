@@ -163,6 +163,7 @@ with st.sidebar:
         (
             "Claude 4.6 Sonnet",
             "Claude 5.5 Opus",
+            "Claude 5.5 Sonnet",
             "Claude 5.0 Sonnet",
             "Claude 5.0 Opus",
             "Claude Fable 5",
