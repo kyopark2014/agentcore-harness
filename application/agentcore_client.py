@@ -541,7 +541,8 @@ _HARNESS_SYSTEM_PROMPT_BASE = (
     "3. 코드 실행·파일 생성 시 반드시 ARTIFACTS_DIR(actor별 폴더) 아래에 산출물을 저장한다\n"
     "4. 결과 파일이 있으면 artifact-share MCP의 share_artifact로 공유 URL을 제공한다 "
     "(filepath는 'artifacts/파일명' 또는 ARTIFACTS_DIR 절대경로; actor_id 필수; "
-    "세션 스토리지에서 artifacts/{actor_id}/... 로 복사된다)\n"
+    "세션 스토리지에서 artifacts/{actor_id}/... 로 복사된다. "
+    ".md/.json/.csv 미리보기는 View URL, 파일 저장은 Download URL을 답변에 쓴다)\n"
     "5. 최종 결과를 사용자에게 전달한다\n"
 )
 

@@ -3,7 +3,7 @@
 Harness writes under ARTIFACTS_DIR ``/mnt/workspace/{actor_id}/artifacts``.
 S3 Files stores that as ``agentcore-sessions/{actor_id}/artifacts/...``.
 This server copies to ``artifacts/{actor_id}/...`` (``s3:CopyObject``) and
-returns the CloudFront download URL.
+returns a stable View (CloudFront) URL plus a short-lived Download (presigned GET).
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from urllib.parse import quote
 
 import boto3
@@ -32,7 +33,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(script_dir, "config.json")
 
 _SESSION_MOUNT = "/mnt/workspace"
-_S3_FILES_SESSION_PREFIX = "agentcore-sessions/"
+_S3_FILES_SESSION_PREFIX = ""
 _ALLOWED_DEST_PREFIXES = ("artifacts/", "images/", "docs/")
 # S3 Files can lag ~60s behind /mnt/workspace writes; retry HeadObject.
 _SYNC_MAX_ATTEMPTS = max(1, int(os.environ.get("S3_FILES_SYNC_MAX_ATTEMPTS", "10")))
@@ -40,6 +41,11 @@ _SYNC_BASE_DELAY_SEC = max(0.5, float(os.environ.get("S3_FILES_SYNC_BASE_DELAY_S
 _SYNC_MAX_DELAY_SEC = max(
     _SYNC_BASE_DELAY_SEC, float(os.environ.get("S3_FILES_SYNC_MAX_DELAY_SEC", "20"))
 )
+_PRESIGN_GET_EXPIRES = max(
+    60, int(os.environ.get("ARTIFACT_PRESIGN_GET_EXPIRES", str(12 * 3600)))
+)
+_DEST_HEAD_TIMEOUT_SEC = 10.0
+_DEST_HEAD_INTERVAL_SEC = 0.25
 
 
 def _load_config() -> dict:
@@ -182,8 +188,19 @@ def _source_keys(filepath: str, actor_id: str, dest_key: str) -> list[str]:
     if user and rest:
         _add(f"{user}/{prefix}/{rest}")
         _add(f"{prefix}/{user}/{rest}")
+        _add(f"agentcore-sessions/{user}/{prefix}/{rest}")
     _add(dest_key)
     return keys
+
+
+def _nfc_s3_key(key: str) -> str:
+    """Compose Hangul in each path segment so NFC/NFD lookups share one key."""
+    parts = [
+        unicodedata.normalize("NFC", part)
+        for part in (key or "").split("/")
+        if part
+    ]
+    return "/".join(parts)
 
 
 def _public_url(key: str) -> str:
@@ -194,6 +211,75 @@ def _public_url(key: str) -> str:
         f"https://{_region}.console.aws.amazon.com/s3/object/{_bucket}"
         f"?prefix={quote(key, safe='')}"
     )
+
+
+def _s3_client_for_presign():
+    """Regional virtual-hosted S3 client for browser-safe presigned URLs."""
+    from botocore.config import Config
+
+    return boto3.client(
+        service_name="s3",
+        region_name=_region,
+        endpoint_url=f"https://s3.{_region}.amazonaws.com",
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "virtual"},
+        ),
+    )
+
+
+def _presigned_get_url(key: str, *, expires_in: int = _PRESIGN_GET_EXPIRES) -> str | None:
+    if not _bucket or not key:
+        return None
+    try:
+        return _s3_client_for_presign().generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": _bucket, "Key": key},
+            ExpiresIn=max(60, int(expires_in)),
+            HttpMethod="GET",
+        )
+    except Exception:
+        logger.warning("presigned GET failed for key=%s", key, exc_info=True)
+        return None
+
+
+def _wait_for_s3_object(client, *, key: str) -> None:
+    """Poll head_object until the sharing key is visible via the S3 API."""
+    deadline = time.monotonic() + _DEST_HEAD_TIMEOUT_SEC
+    last_error: Exception | None = None
+    while True:
+        try:
+            client.head_object(Bucket=_bucket, Key=key)
+            return
+        except ClientError as exc:
+            last_error = exc
+            code = (exc.response.get("Error") or {}).get("Code", "")
+            if code not in {"404", "NoSuchKey", "NotFound"}:
+                raise
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(_DEST_HEAD_INTERVAL_SEC)
+    if last_error is not None:
+        raise RuntimeError(
+            f"S3 object not visible after share: s3://{_bucket}/{key}"
+        ) from last_error
+    raise RuntimeError(f"S3 object not visible after share: s3://{_bucket}/{key}")
+
+
+def _format_share_result(key: str) -> str:
+    lines = ["Upload complete."]
+    lines.append(f"View: {_public_url(key)}")
+    download_url = _presigned_get_url(key)
+    if download_url:
+        lines.append(
+            f"Download (expires in {_PRESIGN_GET_EXPIRES}s): {download_url}"
+        )
+    lines.append(
+        "For .md/.json/.csv prefer the View URL in the reply "
+        "(browser preview when cookies allow). Use Download for direct file save "
+        "(works without CloudFront signed cookies; expires)."
+    )
+    return "\n".join(lines)
 
 
 def _head_first_existing(client, candidates: list[str]) -> str | None:
@@ -226,7 +312,7 @@ def _copy_to_sharing(filepath: str, actor_id: str) -> str:
         return "Upload failed: filepath is required"
 
     filepath = str(filepath).strip()
-    dest = _dest_key(filepath, uid)
+    dest = _nfc_s3_key(_dest_key(filepath, uid))
     if not dest.startswith(_ALLOWED_DEST_PREFIXES):
         return (
             "Upload failed: S3 key must start with "
@@ -234,7 +320,11 @@ def _copy_to_sharing(filepath: str, actor_id: str) -> str:
         )
 
     client = boto3.client("s3", region_name=_region)
-    candidates = _source_keys(filepath, uid, dest)
+    candidates = [_nfc_s3_key(k) for k in _source_keys(filepath, uid, dest)]
+    # Keep original spellings too (NFD session keys from macOS mounts).
+    for key in _source_keys(filepath, uid, dest):
+        if key not in candidates:
+            candidates.append(key)
 
     try:
         source = None
@@ -297,7 +387,9 @@ def _copy_to_sharing(filepath: str, actor_id: str) -> str:
         else:
             logger.info("object already at sharing key: %s", dest)
 
-        return f"Upload complete: {_public_url(dest)}"
+        # Ensure the sharing key is visible before returning URLs (viewer/presign).
+        _wait_for_s3_object(client, key=dest)
+        return _format_share_result(dest)
     except Exception as e:
         logger.error("upload failed: %s", e)
         return f"Upload failed: {e}"
@@ -308,13 +400,16 @@ try:
         name="artifact-share",
         instructions=(
             "You copy Harness ARTIFACTS_DIR files to the CloudFront sharing "
-            "prefix on the project S3 bucket and return download URLs. "
+            "prefix on the project S3 bucket and return View + Download URLs. "
             "Always pass actor_id from the system prompt (account login id) "
             "— never a nickname. Pass filepath as "
             "'/mnt/workspace/{actor_id}/artifacts/<file>' or 'artifacts/<file>'. "
             "The server copies "
             "agentcore-sessions/{actor_id}/artifacts/... → "
-            "artifacts/{actor_id}/... (S3 CopyObject)."
+            "artifacts/{actor_id}/... (S3 CopyObject), then returns a stable "
+            "View (CloudFront) URL and a short-lived Download (presigned GET). "
+            "In replies: prefer View for .md/.json/.csv preview; use Download "
+            "when the user needs to save the file (no CloudFront cookies)."
         ),
         host="0.0.0.0",
         stateless_http=True,
@@ -328,7 +423,7 @@ except Exception as e:
 @mcp.tool()
 def share_artifact(filepath: str, actor_id: str) -> str:
     """
-    Copy a session artifact to the sharing S3 prefix and return a CloudFront URL.
+    Copy a session artifact to the sharing S3 prefix and return View/Download URLs.
 
     Copies like ``aws s3 cp`` within the project bucket:
     agentcore-sessions/{actor_id}/artifacts/... → artifacts/{actor_id}/...
@@ -336,7 +431,7 @@ def share_artifact(filepath: str, actor_id: str) -> str:
     filepath: ARTIFACTS_DIR path, e.g.
         '/mnt/workspace/{actor_id}/artifacts/report.pdf' or 'artifacts/report.pdf'.
     actor_id: account login id from the system prompt. Do NOT use a nickname.
-    return: 'Upload complete: <url>' or an error message.
+    return: View (CloudFront) + Download (presigned GET, time-limited), or an error.
     """
     logger.info("share_artifact --> filepath=%s actor_id=%s", filepath, actor_id)
     try:

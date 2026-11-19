@@ -3,7 +3,7 @@
 Harness가 호출하는 IAM 인증 산출물 공유 MCP입니다.
 `ARTIFACTS_DIR`(`/mnt/workspace/{user_id}/artifacts`)에 저장된 산출물을
 프로젝트 S3의 공유 키 `artifacts/{user_id}/...`로 **복사**한 뒤
-CloudFront `SHARING_URL` 기반 다운로드 URL을 반환합니다.
+**View**(CloudFront 안정 URL)와 **Download**(presigned GET, 기본 12시간)를 반환합니다.
 
 S3 Files 마운트 실제 키:
 
@@ -12,7 +12,8 @@ S3 Files 마운트 실제 키:
   → s3://{bucket}/agentcore-sessions/{user_id}/artifacts/file
   → (CopyObject)
   → s3://{bucket}/artifacts/{user_id}/file
-  → https://{SHARING_URL}/artifacts/{user_id}/file
+  → View: https://{SHARING_URL}/artifacts/{user_id}/file
+  → Download: https://{bucket}.s3.{region}.amazonaws.com/...?X-Amz-...
 ```
 
 `installer.py`가 Docker 이미지를 ECR에 푸시하고 AgentCore Runtime(MCP protocol)으로
@@ -38,6 +39,7 @@ python -m mcp_server_artifact_share
 | `S3_FILES_SYNC_MAX_ATTEMPTS` | 기본 `10` — S3 Files flush 대기 HeadObject 재시도 |
 | `S3_FILES_SYNC_BASE_DELAY_SEC` | 기본 `3` — 첫 재시도 대기(초), 이후 지수 증가 |
 | `S3_FILES_SYNC_MAX_DELAY_SEC` | 기본 `20` — 재시도 대기 상한(초) |
+| `ARTIFACT_PRESIGN_GET_EXPIRES` | 기본 `43200`(12h) — Download presigned GET 만료(초). IAM 역할 임시 자격 수명에 의해 더 짧아질 수 있음 |
 
 ## Tool
 
@@ -45,4 +47,6 @@ python -m mcp_server_artifact_share
 
 - `actor_id` 필수 (별도 Runtime이라 env에서 주입되지 않음; system prompt의 계정 로그인 ID)
 - `filepath`: `/mnt/workspace/{actor_id}/artifacts/...` 또는 `artifacts/...`
-- 동작: 세션 키 → 공유 키로 `CopyObject` (`aws s3 cp`와 동일)
+- 동작: 세션 키 → 공유 키로 `CopyObject` (`aws s3 cp`와 동일) 후 dest `HeadObject` 확인
+- 반환: `View:` CloudFront URL + `Download:` 짧은 수명 presigned GET  
+  (Playground 등 CloudFront signed cookie가 없는 클라이언트는 Download를 사용)
